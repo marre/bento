@@ -383,44 +383,24 @@ func (k *kafkaServerInput) handleMetadata(conn net.Conn, correlationID int32, ve
 }
 
 func (k *kafkaServerInput) handleProduce(conn net.Conn, correlationID int32, version int16, b *kbin.Reader) error {
-	// Parse Produce request
+	// Use kmsg to parse the ProduceRequest
 	req := kmsg.NewProduceRequest()
 	req.Version = version
 
-	// Read client ID (nullable string)
-	clientIDLen := b.Int16()
-	if clientIDLen > 0 {
-		clientID := make([]byte, clientIDLen)
-		copy(clientID, b.Span(int(clientIDLen)))
+	// Read the request from the buffer
+	// Note: b already has the header consumed, so we read from current position
+	if err := req.ReadFrom(b.Src[b.Off:]); err != nil {
+		k.logger.Errorf("Failed to parse ProduceRequest: %v", err)
+		return k.sendProduceErrorResponse(conn, correlationID, version, 2) // UNKNOWN_SERVER_ERROR
 	}
 
-	// Read TransactionalID (nullable string) - version 3+
-	if version >= 3 {
-		transactionalIDLen := b.Int16()
-		if transactionalIDLen > 0 {
-			b.Span(int(transactionalIDLen))
-		}
-	}
-
-	// Read Acks
-	acks := b.Int16()
-
-	// Read Timeout
-	timeout := b.Int32()
-	_ = timeout
-
-	// Read Topics array
-	numTopics := b.Int32()
-
+	acks := req.Acks
 	var batch service.MessageBatch
 	remoteAddr := conn.RemoteAddr().String()
 
-	for i := 0; i < int(numTopics); i++ {
-		topicLen := b.Int16()
-		if topicLen <= 0 {
-			continue
-		}
-		topicName := string(b.Span(int(topicLen)))
+	// Iterate through topics using kmsg's typed structures
+	for _, topic := range req.Topics {
+		topicName := topic.Topic
 
 		// Check if topic is allowed
 		if k.allowedTopics != nil {
@@ -430,21 +410,14 @@ func (k *kafkaServerInput) handleProduce(conn net.Conn, correlationID int32, ver
 			}
 		}
 
-		// Read Partitions array
-		numPartitions := b.Int32()
-		for j := 0; j < int(numPartitions); j++ {
-			partition := b.Int32()
-
-			// Read RecordSet size
-			recordSetSize := b.Int32()
-			if recordSetSize <= 0 {
+		// Iterate through partitions
+		for _, partition := range topic.Partitions {
+			if partition.Records == nil || len(partition.Records) == 0 {
 				continue
 			}
 
-			recordSetData := b.Span(int(recordSetSize))
-
 			// Parse records from the record batch
-			messages, err := k.parseRecordBatch(recordSetData, topicName, partition, remoteAddr)
+			messages, err := k.parseRecordBatch(partition.Records, topicName, partition.Partition, remoteAddr)
 			if err != nil {
 				k.logger.Errorf("Failed to parse record batch: %v", err)
 				continue
@@ -454,14 +427,9 @@ func (k *kafkaServerInput) handleProduce(conn net.Conn, correlationID int32, ver
 		}
 	}
 
-	if b.Err != nil {
-		k.logger.Errorf("Error parsing produce request: %v", b.Err)
-		return k.sendProduceErrorResponse(conn, correlationID, version, 2) // UNKNOWN_SERVER_ERROR
-	}
-
 	// If no messages, send success
 	if len(batch) == 0 {
-		return k.sendProduceResponse(conn, correlationID, version, acks)
+		return k.sendProduceResponse(conn, correlationID, version, req.Acks)
 	}
 
 	// Send batch to pipeline
@@ -482,7 +450,7 @@ func (k *kafkaServerInput) handleProduce(conn net.Conn, correlationID int32, ver
 	}
 
 	// Wait for acknowledgment if acks > 0
-	if acks > 0 {
+	if req.Acks > 0 {
 		select {
 		case err := <-resChan:
 			if err != nil {
@@ -495,7 +463,7 @@ func (k *kafkaServerInput) handleProduce(conn net.Conn, correlationID int32, ver
 		}
 	}
 
-	return k.sendProduceResponse(conn, correlationID, version, acks)
+	return k.sendProduceResponse(conn, correlationID, version, req.Acks)
 }
 
 func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
