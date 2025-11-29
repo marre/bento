@@ -473,122 +473,74 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 
 	b := kbin.Reader{Src: data}
 
-	// Read record batch header
+	// Read record batch header (61 bytes total)
 	baseOffset := b.Int64()
 	batchLength := b.Int32()
-	partitionLeaderEpoch := b.Int32()
+	_ = b.Int32() // partitionLeaderEpoch
 	magic := b.Int8()
 
-	_ = baseOffset
-	_ = batchLength
-	_ = partitionLeaderEpoch
-
 	if magic != 2 {
-		return nil, fmt.Errorf("unsupported magic byte: %d", magic)
+		return nil, fmt.Errorf("unsupported magic byte: %d (only magic byte 2 is supported)", magic)
 	}
 
-	crc := b.Int32()
-	_ = crc
-
-	attributes := b.Int16()
-	_ = attributes
-
-	lastOffsetDelta := b.Int32()
-	_ = lastOffsetDelta
-
+	_ = b.Int32() // crc
+	_ = b.Int16() // attributes
+	_ = b.Int32() // lastOffsetDelta
 	firstTimestamp := b.Int64()
-	maxTimestamp := b.Int64()
-	_ = firstTimestamp
-	_ = maxTimestamp
-
-	producerID := b.Int64()
-	producerEpoch := b.Int16()
-	baseSequence := b.Int32()
-	_ = producerID
-	_ = producerEpoch
-	_ = baseSequence
-
+	_ = b.Int64() // maxTimestamp
+	_ = b.Int64() // producerID
+	_ = b.Int16() // producerEpoch
+	_ = b.Int32() // baseSequence
 	numRecords := b.Int32()
+
+	if b.Err != nil {
+		return nil, fmt.Errorf("failed to parse record batch header: %w", b.Err)
+	}
 
 	var batch service.MessageBatch
 
+	// Parse individual records using kmsg.Record
 	for i := 0; i < int(numRecords); i++ {
-		length := b.Varint()
-		if length <= 0 {
+		// Use kmsg.Record to parse each record
+		record := kmsg.NewRecord()
+		if err := record.ReadFrom(b.Src[b.Off:]); err != nil {
+			k.logger.Warnf("Failed to parse record %d: %v", i, err)
 			continue
 		}
 
-		recordStart := len(b.Src) - len(b.Src[b.Off:])
+		// Advance the reader past the record we just parsed
+		recordLen := record.Length
+		b.Off += int(recordLen) + kbin.VarintLen(int64(recordLen))
 
-		attributes := b.Int8()
-		_ = attributes
+		// Calculate absolute timestamp
+		timestamp := firstTimestamp + record.TimestampDelta64
 
-		timestampDelta := b.Varint()
-		timestamp := firstTimestamp + timestampDelta
-
-		offsetDelta := b.Varint()
-		_ = offsetDelta
-
-		keyLen := b.Varint()
-		var key []byte
-		if keyLen > 0 {
-			key = make([]byte, keyLen)
-			copy(key, b.Span(int(keyLen)))
-		} else if keyLen == -1 {
-			// Null key
-			key = nil
-		}
-
-		valueLen := b.Varint()
-		var value []byte
-		if valueLen > 0 {
-			value = make([]byte, valueLen)
-			copy(value, b.Span(int(valueLen)))
-		} else if valueLen == -1 {
-			// Null value (tombstone)
-			value = nil
-		}
-
-		headersCount := b.Varint()
-		headers := make(map[string]string)
-		for h := 0; h < int(headersCount); h++ {
-			headerKeyLen := b.Varint()
-			headerKey := string(b.Span(int(headerKeyLen)))
-
-			headerValueLen := b.Varint()
-			var headerValue string
-			if headerValueLen > 0 {
-				headerValue = string(b.Span(int(headerValueLen)))
-			}
-
-			headers[headerKey] = headerValue
-		}
-
-		// Verify we read the expected length
-		recordEnd := len(b.Src) - len(b.Src[b.Off:])
-		if recordEnd-recordStart != int(length) {
-			k.logger.Warnf("Record length mismatch: expected %d, got %d", length, recordEnd-recordStart)
-		}
-
-		// Create message
-		msg := service.NewMessage(value)
+		// Create Bento message
+		msg := service.NewMessage(record.Value)
 		msg.MetaSetMut("kafka_server_topic", topic)
 		msg.MetaSetMut("kafka_server_partition", partition)
-		if key != nil {
-			msg.MetaSetMut("kafka_server_key", string(key))
+		msg.MetaSetMut("kafka_server_offset", baseOffset+int64(record.OffsetDelta))
+
+		if record.Key != nil {
+			msg.MetaSetMut("kafka_server_key", string(record.Key))
 		}
+
 		msg.MetaSetMut("kafka_server_timestamp", time.Unix(timestamp/1000, (timestamp%1000)*1000000).Format(time.RFC3339))
 		msg.MetaSetMut("kafka_server_remote_addr", remoteAddr)
 
-		// Add headers as metadata
-		for hk, hv := range headers {
-			msg.MetaSetMut(hk, hv)
+		// Add record headers as metadata
+		for _, header := range record.Headers {
+			msg.MetaSetMut(header.Key, string(header.Value))
 		}
 
 		batch = append(batch, msg)
 	}
 
-	return batch, b.Err
+	if b.Err != nil {
+		return nil, fmt.Errorf("error parsing records: %w", b.Err)
+	}
+
+	return batch, nil
 }
 
 func (k *kafkaServerInput) sendProduceResponse(conn net.Conn, correlationID int32, version int16, acks int16) error {
