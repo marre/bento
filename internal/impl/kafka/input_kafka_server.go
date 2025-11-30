@@ -675,6 +675,14 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		return nil, fmt.Errorf("failed to parse record batch: %w", err)
 	}
 
+	fmt.Printf("DEBUG: RecordBatch has %d records, Attributes=0x%x, Records len=%d\n", recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
+
+	// Check for compression (lower 3 bits of Attributes)
+	compression := recordBatch.Attributes & 0x07
+	if compression != 0 {
+		return nil, fmt.Errorf("compressed records not yet supported (compression type=%d)", compression)
+	}
+
 	var batch service.MessageBatch
 
 	// Parse individual records from the Records byte array
@@ -682,21 +690,36 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 	offset := 0
 
 	for i := 0; i < int(recordBatch.NumRecords); i++ {
+		fmt.Printf("DEBUG: Parsing record %d/%d, offset=%d, recordsDataLen=%d\n", i+1, recordBatch.NumRecords, offset, len(recordsData))
 		if offset >= len(recordsData) {
 			k.logger.Warnf("Reached end of data while parsing record %d/%d", i, recordBatch.NumRecords)
 			break
 		}
 
-		// Parse each record using kmsg.Record
+		// Read the varint length prefix
+		recordLen, lenBytes := kbin.Varint(recordsData[offset:])
+		if lenBytes == 0 {
+			k.logger.Warnf("Failed to read length varint for record %d", i)
+			break
+		}
+		fmt.Printf("DEBUG: Record %d length prefix: %d bytes (recordLen=%d)\n", i, lenBytes, recordLen)
+		offset += lenBytes
+
+		if offset+int(recordLen) > len(recordsData) {
+			k.logger.Warnf("Record %d extends beyond data bounds: offset=%d, recordLen=%d, dataLen=%d", i, offset, recordLen, len(recordsData))
+			break
+		}
+
+		// Parse the record from the exact slice
 		record := kmsg.NewRecord()
-		if err := record.ReadFrom(recordsData[offset:]); err != nil {
+		if err := record.ReadFrom(recordsData[offset : offset+int(recordLen)]); err != nil {
+			fmt.Printf("DEBUG: Failed to parse record %d: %v\n", i, err)
 			k.logger.Warnf("Failed to parse record %d: %v", i, err)
+			offset += int(recordLen) // Skip this record
 			continue
 		}
 
-		// Advance offset past the record we just parsed
-		recordLen := record.Length
-		offset += int(recordLen) + kbin.VarintLen(int32(recordLen))
+		offset += int(recordLen)
 
 		// Calculate absolute timestamp
 		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
@@ -705,6 +728,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		msg := service.NewMessage(record.Value)
 		msg.MetaSetMut("kafka_server_topic", topic)
 		msg.MetaSetMut("kafka_server_partition", partition)
+		fmt.Printf("DEBUG: Set partition metadata: value=%v, type=%T\n", partition, partition)
 		msg.MetaSetMut("kafka_server_offset", recordBatch.FirstOffset+int64(record.OffsetDelta))
 
 		if record.Key != nil {

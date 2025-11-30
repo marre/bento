@@ -153,8 +153,11 @@ timeout: "5s"
 	assert.True(t, exists)
 	assert.Equal(t, testKey, key)
 
-	partition, exists := msg.MetaGet("kafka_server_partition")
+	partitionAny, exists := msg.MetaGetMut("kafka_server_partition")
 	assert.True(t, exists)
+	fmt.Printf("TEST: Got partition: value=%v, type=%T\n", partitionAny, partitionAny)
+	partition, ok := partitionAny.(int32)
+	assert.True(t, ok, "partition should be int32")
 	assert.Equal(t, int32(0), partition)
 
 	// Verify header
@@ -202,6 +205,7 @@ address: "127.0.0.1:19093"
 	// Create producer
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers("127.0.0.1:19093"),
+		kgo.ProducerBatchCompression(kgo.NoCompression()), // Disable compression for testing
 	)
 	require.NoError(t, err)
 	defer client.Close()
