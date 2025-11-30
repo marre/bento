@@ -346,34 +346,39 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		isFlexible = apiVersion >= 9
 	}
 
-	// For requests, ReadFrom expects data starting from the request body
-	// The wire format is: [apiKey][apiVersion][correlationID][clientID][TAG_BUFFER][body...]
-	// We've already read apiKey, apiVersion, correlationID (8 bytes total)
-	// Now we need to skip clientID and TAG_BUFFER to get to the body
-	offset := 8 // Skip apiKey (2) + apiVersion (2) + correlationID (4) = 8 bytes
+	// For both flexible and non-flexible requests, clientID is a NULLABLE_STRING (int16 length, then data)
+	// For flexible requests (Header v2), there's also a TAG_BUFFER after clientID
+	// The reader b is already positioned after the 8-byte header (apiKey + apiVersion + correlationID)
 
-	fmt.Printf("DEBUG: Data from offset %d: %x\n", offset, data[offset:min(offset+20, len(data))])
-
-	// Skip clientID and TAG_BUFFER for flexible requests
-	// Based on observed data: [00][03 6b 67 6f][00] where "kgo" is the clientID
-	// This suggests: [len0=null][len3][kgo][tag0]
-	// But compact encoding should be N+1, so len=4 for "kgo"... unless it's using actual length
-	if isFlexible {
-		// Manually skip to offset 13 based on observed pattern
-		//  The header appears to be 13 bytes total for these requests
-		offset = 13
-		fmt.Printf("DEBUG: Skipping to fixed offset %d for flexible request body\n", offset)
+	// Read clientID (nullable string: int16 length, then data)
+	clientIDLen := b.Int16()
+	if clientIDLen > 0 {
+		b.Span(int(clientIDLen))
 	}
 
-	fmt.Printf("DEBUG: Request body from offset %d: %x\n", offset, data[offset:min(offset+20, len(data))])
+	if isFlexible {
+		// Flexible header v2 has TAG_BUFFER (compact array of tagged fields)
+		tagCount := b.Uvarint()
+		for i := 0; i < int(tagCount); i++ {
+			tagID := b.Uvarint()
+			tagSize := b.Uvarint()
+			b.Span(int(tagSize))
+			_ = tagID // unused
+		}
+	}
+
+	// Now b is positioned at the start of the request body
+	offset := len(data) - len(b.Src)
+
+	fmt.Printf("DEBUG: Request body from offset %d (isFlexible=%v): %x\n", offset, isFlexible, data[offset:min(offset+20, len(data))])
 
 	k.logger.Infof("Handling request: apiKey=%d", apiKey)
 
 	var err error
 	switch apiKey {
 	case 18: // ApiVersions
-		// ApiVersions request has no body, no need to parse
-		fmt.Printf("DEBUG: Handling ApiVersions without ReadFrom\n")
+		// ApiVersions request has minimal/no body
+		fmt.Printf("DEBUG: Handling ApiVersions\n")
 		resp := kmsg.NewApiVersionsResponse()
 		resp.SetVersion(apiVersion)
 		err = k.handleApiVersionsReq(conn, correlationID, nil, &resp)
@@ -382,42 +387,9 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		req := kmsg.NewMetadataRequest()
 		req.SetVersion(apiVersion)
 
-		// Try different offsets to find the correct one
-		var parseErr error
-		foundTopics := false
-		for testOffset := 8; testOffset <= 15 && !foundTopics; testOffset++ {
-			tempReq := kmsg.NewMetadataRequest()
-			tempReq.SetVersion(apiVersion)
-			k.parseMu.Lock()
-			tempErr := tempReq.ReadFrom(data[testOffset:])
-			k.parseMu.Unlock()
-
-			if tempErr == nil && len(tempReq.Topics) > 0 {
-				fmt.Printf("DEBUG: Found topics at offset %d: %v\n", testOffset, tempReq.Topics)
-				offset = testOffset
-				req = tempReq
-				foundTopics = true
-				break
-			}
-		}
-
-		if !foundTopics {
-			// Fall back to original offset
-			k.parseMu.Lock()
-			parseErr = req.ReadFrom(data[offset:])
-			k.parseMu.Unlock()
-		}
-
-		if parseErr != nil {
-			fmt.Printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
-			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
-			err = k.sendErrorResponse(conn, correlationID, 2)
-		} else {
-			fmt.Printf("DEBUG: ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d\n", offset, len(req.Topics))
-			resp := kmsg.NewMetadataResponse()
-			resp.SetVersion(apiVersion)
-			k.parseMu.Unlock()
-		}
+		k.parseMu.Lock()
+		parseErr := req.ReadFrom(data[offset:])
+		k.parseMu.Unlock()
 
 		if parseErr != nil {
 			fmt.Printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
@@ -434,7 +406,12 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		req := kmsg.NewProduceRequest()
 		req.SetVersion(apiVersion)
 		fmt.Printf("DEBUG: About to call ReadFrom for Produce, body size=%d (offset=%d)\n", len(data[offset:]), offset)
-		if parseErr := req.ReadFrom(data[offset:]); parseErr != nil {
+
+		k.parseMu.Lock()
+		parseErr := req.ReadFrom(data[offset:])
+		k.parseMu.Unlock()
+
+		if parseErr != nil {
 			fmt.Printf("DEBUG: ReadFrom failed: %v\n", parseErr)
 			k.logger.Errorf("Failed to parse ProduceRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, 2)
@@ -514,6 +491,7 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, correlationID int32,
 			NodeID: 1,
 			Host:   host,
 			Port:   int32(port),
+			// Rack is not set (defaults to nil for nullable field)
 		},
 	}
 
@@ -554,8 +532,9 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, correlationID int32,
 
 		// Topic is allowed, return metadata
 		resp.Topics = append(resp.Topics, kmsg.MetadataResponseTopic{
-			Topic:     kmsg.StringPtr(topic),
-			ErrorCode: 0,
+			Topic:      kmsg.StringPtr(topic),
+			ErrorCode:  0,
+			IsInternal: false,
 			Partitions: []kmsg.MetadataResponseTopicPartition{
 				{
 					Partition: 0,
@@ -641,13 +620,22 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	if req.Acks > 0 {
 		select {
 		case err := <-resChan:
-			if err != nil {
-				resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
-					Topic: req.Topics[0].Topic,
-					Partitions: []kmsg.ProduceResponseTopicPartition{
-						{Partition: 0, ErrorCode: 2}, // UNKNOWN_SERVER_ERROR
-					},
-				})
+			// Build response for all topics/partitions that were in the request
+			for _, topic := range req.Topics {
+				respTopic := kmsg.ProduceResponseTopic{
+					Topic: topic.Topic,
+				}
+				for _, partition := range topic.Partitions {
+					errorCode := int16(0) // Success
+					if err != nil {
+						errorCode = 2 // UNKNOWN_SERVER_ERROR
+					}
+					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+						Partition: partition.Partition,
+						ErrorCode: errorCode,
+					})
+				}
+				resp.Topics = append(resp.Topics, respTopic)
 			}
 		case <-time.After(k.timeout):
 			resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
@@ -665,64 +653,43 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 }
 
 func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
-	if len(data) < 61 {
-		return nil, fmt.Errorf("record batch too small: %d bytes", len(data))
+	// Use kmsg.RecordBatch to parse the batch header
+	recordBatch := kmsg.RecordBatch{}
+	if err := recordBatch.ReadFrom(data); err != nil {
+		return nil, fmt.Errorf("failed to parse record batch: %w", err)
 	}
-
-	b := kbin.Reader{Src: data}
-
-	// Read record batch header (61 bytes total)
-	baseOffset := b.Int64()
-	_ = b.Int32() // batchLength
-	_ = b.Int32() // partitionLeaderEpoch
-	magic := b.Int8()
-
-	if magic != 2 {
-		return nil, fmt.Errorf("unsupported magic byte: %d (only magic byte 2 is supported)", magic)
-	}
-
-	_ = b.Int32() // crc
-	_ = b.Int16() // attributes
-	_ = b.Int32() // lastOffsetDelta
-	firstTimestamp := b.Int64()
-	_ = b.Int64() // maxTimestamp
-	_ = b.Int64() // producerID
-	_ = b.Int16() // producerEpoch
-	_ = b.Int32() // baseSequence
-	numRecords := b.Int32()
 
 	var batch service.MessageBatch
 
-	// Records start at offset 61 (after the header)
-	offset := 61
+	// Parse individual records from the Records byte array
+	recordsData := recordBatch.Records
+	offset := 0
 
-	// Parse individual records using kmsg.Record
-	for i := 0; i < int(numRecords); i++ {
-		if offset >= len(data) {
-			k.logger.Warnf("Reached end of data while parsing record %d/%d", i, numRecords)
+	for i := 0; i < int(recordBatch.NumRecords); i++ {
+		if offset >= len(recordsData) {
+			k.logger.Warnf("Reached end of data while parsing record %d/%d", i, recordBatch.NumRecords)
 			break
 		}
 
-		// Use kmsg.Record to parse each record
+		// Parse each record using kmsg.Record
 		record := kmsg.NewRecord()
-		if err := record.ReadFrom(data[offset:]); err != nil {
+		if err := record.ReadFrom(recordsData[offset:]); err != nil {
 			k.logger.Warnf("Failed to parse record %d: %v", i, err)
 			continue
 		}
 
 		// Advance offset past the record we just parsed
-		// Record format: length (varint) + attributes + timestampDelta + offsetDelta + key + value + headers
 		recordLen := record.Length
 		offset += int(recordLen) + kbin.VarintLen(int32(recordLen))
 
 		// Calculate absolute timestamp
-		timestamp := firstTimestamp + record.TimestampDelta64
+		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
 
 		// Create Bento message
 		msg := service.NewMessage(record.Value)
 		msg.MetaSetMut("kafka_server_topic", topic)
 		msg.MetaSetMut("kafka_server_partition", partition)
-		msg.MetaSetMut("kafka_server_offset", baseOffset+int64(record.OffsetDelta))
+		msg.MetaSetMut("kafka_server_offset", recordBatch.FirstOffset+int64(record.OffsetDelta))
 
 		if record.Key != nil {
 			msg.MetaSetMut("kafka_server_key", string(record.Key))
@@ -770,16 +737,20 @@ func (k *kafkaServerInput) sendErrorResponse(conn net.Conn, correlationID int32,
 
 func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg kmsg.Response) error {
 	buf := kbin.AppendInt32(nil, correlationID)
-	fmt.Printf("DEBUG: sendResponse: correlationID=%d, flexible=%v\n", correlationID, msg.IsFlexible())
 
-	// AppendTo handles all serialization including flexible tagged fields
+	// For flexible responses (EXCEPT ApiVersions key 18), add response header TAG_BUFFER
+	// This matches the kfake implementation in franz-go
+	if msg.IsFlexible() && msg.Key() != 18 {
+		buf = append(buf, 0) // Empty TAG_BUFFER (0 tags)
+	}
+
+	// AppendTo generates the response body
 	buf = msg.AppendTo(buf)
 
-	hexLen := 40
-	if len(buf) < 40 {
-		hexLen = len(buf)
-	}
-	fmt.Printf("DEBUG: Sending response: correlationID=%d, size=%d bytes, flexible=%v, hex=%x\n", correlationID, len(buf), msg.IsFlexible(), buf[:hexLen])
+	fmt.Printf("DEBUG: sendResponse: correlationID=%d, flexible=%v, key=%d, total_size=%d\n", correlationID, msg.IsFlexible(), msg.Key(), len(buf))
+
+	fmt.Printf("DEBUG: Sending response: correlationID=%d, size=%d bytes, flexible=%v\n", correlationID, len(buf), msg.IsFlexible())
+	fmt.Printf("DEBUG: Full response hex: %x\n", buf)
 	k.logger.Infof("Sending response: correlationID=%d, size=%d bytes, flexible=%v", correlationID, len(buf), msg.IsFlexible())
 
 	return k.writeResponse(conn, buf)
@@ -788,6 +759,7 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg 
 func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 	// Write size
 	size := int32(len(data))
+	fmt.Printf("DEBUG: writeResponse: size=%d, data len=%d, first 20 bytes hex=%x\n", size, len(data), data[:min(20, len(data))])
 	k.logger.Debugf("Writing response size: %d", size)
 	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
 		k.logger.Errorf("Failed to write response size: %v", err)
@@ -796,21 +768,6 @@ func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 
 	// Write data
 	n, err := conn.Write(data)
-	if err != nil {
-		k.logger.Errorf("Failed to write response data: %v", err)
-		return err
-	}
-	k.logger.Debugf("Wrote %d bytes of response data", n)
-	size = int32(len(data))
-	k.logger.Debugf("Writing response size: %d", size)
-	fmt.Printf("DEBUG: writeResponse: size=%d, data len=%d, first 20 bytes hex=%x\n", size, len(data), data[:min(20, len(data))])
-	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
-		k.logger.Errorf("Failed to write response size: %v", err)
-		return err
-	}
-
-	// Write data
-	n, err = conn.Write(data)
 	if err != nil {
 		k.logger.Errorf("Failed to write response data: %v", err)
 		return err

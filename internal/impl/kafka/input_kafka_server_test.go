@@ -436,6 +436,25 @@ address: "127.0.0.1:19096"
 // Quick round-trip test: ensure the metadata response we construct can be
 // appended-to a buffer and parsed back by kmsg to avoid the 'not enough
 // data' errors the client observed in integration tests.
+func TestApiVersionsResponseStructure(t *testing.T) {
+	resp := kmsg.NewApiVersionsResponse()
+	resp.SetVersion(3)
+	resp.ErrorCode = 0
+	resp.ApiKeys = []kmsg.ApiVersionsResponseApiKey{
+		{ApiKey: 18, MinVersion: 0, MaxVersion: 3},
+		{ApiKey: 3, MinVersion: 0, MaxVersion: 12},
+		{ApiKey: 0, MinVersion: 0, MaxVersion: 9},
+	}
+
+	// Build buffer like sendResponse does
+	buf := kbin.AppendInt32(nil, 0) // correlationID = 0
+	buf = resp.AppendTo(buf)
+
+	fmt.Printf("TEST: ApiVersions response hex (total %d bytes): %x\n", len(buf), buf)
+	fmt.Printf("TEST: Response body (after correlationID, %d bytes): %x\n", len(buf)-4, buf[4:])
+	fmt.Printf("TEST: Is flexible: %v\n", resp.IsFlexible())
+}
+
 func TestMetadataResponseRoundTrip(t *testing.T) {
 	resp := kmsg.NewMetadataResponse()
 	resp.SetVersion(12)
@@ -458,10 +477,23 @@ func TestMetadataResponseRoundTrip(t *testing.T) {
 	buf := kbin.AppendInt32(nil, 123)
 	buf = resp.AppendTo(buf)
 
+	// Debug: print the hex
+	fmt.Printf("TEST: Metadata response hex (total %d bytes): %x\n", len(buf), buf)
+	fmt.Printf("TEST: Response body (after correlationID, %d bytes): %x\n", len(buf)-4, buf[4:])
+
 	// Now parse back after skipping correlation id
 	parsed := kmsg.NewMetadataResponse()
 	parsed.SetVersion(12)
 	if err := parsed.ReadFrom(buf[4:]); err != nil {
 		t.Fatalf("metadata response failed to parse: %v", err)
+	}
+
+	// Verify parsed data
+	require.Equal(t, 1, len(parsed.Brokers), "should have 1 broker")
+	require.Equal(t, "127.0.0.1", parsed.Brokers[0].Host, "broker host")
+	require.Equal(t, int32(19092), parsed.Brokers[0].Port, "broker port")
+	require.Equal(t, 1, len(parsed.Topics), "should have 1 topic")
+	if parsed.Topics[0].Topic != nil {
+		require.Equal(t, "test-topic", *parsed.Topics[0].Topic, "topic name")
 	}
 }
