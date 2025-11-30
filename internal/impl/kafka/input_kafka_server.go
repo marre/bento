@@ -562,6 +562,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	for _, topic := range req.Topics {
 		topicName := topic.Topic
 		k.logger.Infof("Processing topic: %s, partitions=%d", topicName, len(topic.Partitions))
+		fmt.Printf("DEBUG: Processing topic: %s, partitions=%d\n", topicName, len(topic.Partitions))
 
 		// Check if topic is allowed
 		if k.allowedTopics != nil {
@@ -572,29 +573,37 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		}
 
 		// Iterate through partitions
-		for _, partition := range topic.Partitions {
+		for i, partition := range topic.Partitions {
+			fmt.Printf("DEBUG: Partition %d: Records=%v, len=%d\n", i, partition.Records != nil, len(partition.Records))
 			if partition.Records == nil || len(partition.Records) == 0 {
+				fmt.Printf("DEBUG: Skipping partition %d (empty records)\n", i)
 				continue
 			}
 
 			// Parse records from the record batch
+			fmt.Printf("DEBUG: About to parse record batch for partition %d\n", i)
 			messages, err := k.parseRecordBatch(partition.Records, topicName, partition.Partition, remoteAddr)
 			if err != nil {
+				fmt.Printf("DEBUG: Failed to parse record batch: %v\n", err)
 				k.logger.Errorf("Failed to parse record batch: %v", err)
 				continue
 			}
+			fmt.Printf("DEBUG: Parsed %d messages from partition %d\n", len(messages), i)
 
 			batch = append(batch, messages...)
 		}
 	}
 
+	fmt.Printf("DEBUG: Total batch size: %d messages\n", len(batch))
 	// If no messages, send success
 	if len(batch) == 0 {
+		fmt.Printf("DEBUG: Sending empty response (no messages)\n")
 		return k.sendResponse(conn, correlationID, resp)
 	}
 
 	// Send batch to pipeline
 	resChan := make(chan error, 1)
+	fmt.Printf("DEBUG: Sending batch to pipeline, acks=%d\n", req.Acks)
 	select {
 	case k.msgChan <- messageBatch{
 		batch: batch,
@@ -604,7 +613,9 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		},
 		resChan: resChan,
 	}:
+		fmt.Printf("DEBUG: Successfully sent batch to pipeline\n")
 	case <-time.After(k.timeout):
+		fmt.Printf("DEBUG: Timeout sending batch to pipeline\n")
 		resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
 			Topic: req.Topics[0].Topic,
 			Partitions: []kmsg.ProduceResponseTopicPartition{
@@ -616,8 +627,10 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		return fmt.Errorf("shutting down")
 	}
 
-	// Wait for acknowledgment if acks > 0
-	if req.Acks > 0 {
+	// Wait for acknowledgment if acks != 0 (acks can be -1 for "all", 1 for "leader")
+	fmt.Printf("DEBUG: Checking acks: req.Acks=%d\n", req.Acks)
+	if req.Acks != 0 {
+		fmt.Printf("DEBUG: Waiting for acknowledgment (acks != 0)\n")
 		select {
 		case err := <-resChan:
 			// Build response for all topics/partitions that were in the request
@@ -631,8 +644,11 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 						errorCode = 2 // UNKNOWN_SERVER_ERROR
 					}
 					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-						Partition: partition.Partition,
-						ErrorCode: errorCode,
+						Partition:      partition.Partition,
+						ErrorCode:      errorCode,
+						BaseOffset:     0,  // Starting offset
+						LogAppendTime:  -1, // -1 means CreateTime is used
+						LogStartOffset: 0,  // Earliest offset in partition
 					})
 				}
 				resp.Topics = append(resp.Topics, respTopic)
