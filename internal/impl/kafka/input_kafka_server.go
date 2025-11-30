@@ -19,11 +19,11 @@ import (
 )
 
 const (
-	ksfFieldAddress        = "address"
-	ksfFieldTopics         = "topics"
-	ksfFieldTLS            = "tls"
-	ksfFieldSASL           = "sasl"
-	ksfFieldTimeout        = "timeout"
+	ksfFieldAddress         = "address"
+	ksfFieldTopics          = "topics"
+	ksfFieldTLS             = "tls"
+	ksfFieldSASL            = "sasl"
+	ksfFieldTimeout         = "timeout"
 	ksfFieldMaxMessageBytes = "max_message_bytes"
 )
 
@@ -42,19 +42,19 @@ func kafkaServerInputConfig() *service.ConfigSpec {
 		Description(`
 This input acts as a Kafka broker endpoint, allowing Kafka producers to send messages directly into a Bento pipeline without requiring a full Kafka cluster.
 
-Similar to the ` + "`http_server`" + ` input, this creates a server that external clients can push data to. The difference is that clients use the Kafka protocol instead of HTTP.
+Similar to the `+"`http_server`"+` input, this creates a server that external clients can push data to. The difference is that clients use the Kafka protocol instead of HTTP.
 
 ### Metadata
 
 This input adds the following metadata fields to each message:
 
-` + "```text" + `
+`+"```text"+`
 - kafka_server_topic
 - kafka_server_partition
 - kafka_server_key
 - kafka_server_timestamp
 - kafka_server_remote_addr
-` + "```" + `
+`+"```"+`
 
 Message headers from Kafka records are also added as metadata fields.`).
 		Field(service.NewStringField(ksfFieldAddress).
@@ -124,14 +124,14 @@ type kafkaServerInput struct {
 	shutdownCh chan struct{}
 	logger     *service.Logger
 
-	shutSig    *shutdown.Signaller
-	connWG     sync.WaitGroup
-	parseMu    sync.Mutex // Serialize kmsg parsing to avoid race conditions
+	shutSig *shutdown.Signaller
+	connWG  sync.WaitGroup
+	parseMu sync.Mutex // Serialize kmsg parsing to avoid race conditions
 }
 
 type messageBatch struct {
-	batch  service.MessageBatch
-	ackFn  service.AckFunc
+	batch   service.MessageBatch
+	ackFn   service.AckFunc
 	resChan chan error
 }
 
@@ -395,7 +395,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 			if tempErr == nil && len(tempReq.Topics) > 0 {
 				fmt.Printf("DEBUG: Found topics at offset %d: %v\n", testOffset, tempReq.Topics)
 				offset = testOffset
-				req = &tempReq
+				req = tempReq
 				foundTopics = true
 				break
 			}
@@ -409,7 +409,18 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		}
 
 		if parseErr != nil {
-			fmt.printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
+			fmt.Printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
+			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
+			err = k.sendErrorResponse(conn, correlationID, 2)
+		} else {
+			fmt.Printf("DEBUG: ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d\n", offset, len(req.Topics))
+			resp := kmsg.NewMetadataResponse()
+			resp.SetVersion(apiVersion)
+			k.parseMu.Unlock()
+		}
+
+		if parseErr != nil {
+			fmt.Printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
 			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, 2)
 		} else {
@@ -789,6 +800,22 @@ func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 		k.logger.Errorf("Failed to write response data: %v", err)
 		return err
 	}
+	k.logger.Debugf("Wrote %d bytes of response data", n)
+	size = int32(len(data))
+	k.logger.Debugf("Writing response size: %d", size)
+	fmt.Printf("DEBUG: writeResponse: size=%d, data len=%d, first 20 bytes hex=%x\n", size, len(data), data[:min(20, len(data))])
+	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
+		k.logger.Errorf("Failed to write response size: %v", err)
+		return err
+	}
+
+	// Write data
+	n, err = conn.Write(data)
+	if err != nil {
+		k.logger.Errorf("Failed to write response data: %v", err)
+		return err
+	}
+	fmt.Printf("DEBUG: wrote %d bytes out of %d\n", n, len(data))
 	k.logger.Debugf("Wrote %d bytes of response data", n)
 	return nil
 }

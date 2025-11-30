@@ -3,12 +3,15 @@ package kafka
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -96,6 +99,7 @@ timeout: "5s"
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers("127.0.0.1:19092"),
 		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.WithLogger(kgo.BasicLogger(os.Stdout, kgo.LogLevelDebug, nil)),
 	)
 	require.NoError(t, err)
 	defer client.Close()
@@ -116,8 +120,11 @@ timeout: "5s"
 
 	// Send message asynchronously and wait for acknowledgment
 	produceChan := make(chan error, 1)
+	fmt.Println("TESTDEBUG: starting producer goroutine")
 	go func() {
+		fmt.Println("TESTDEBUG: producer: before ProduceSync")
 		results := client.ProduceSync(ctx, record)
+		fmt.Printf("TESTDEBUG: producer: after ProduceSync, results len=%d err=%v\n", len(results), results[0].Err)
 		if len(results) > 0 {
 			produceChan <- results[0].Err
 		} else {
@@ -424,4 +431,37 @@ address: "127.0.0.1:19096"
 
 	err = ackFn(ctx, nil)
 	require.NoError(t, err)
+}
+
+// Quick round-trip test: ensure the metadata response we construct can be
+// appended-to a buffer and parsed back by kmsg to avoid the 'not enough
+// data' errors the client observed in integration tests.
+func TestMetadataResponseRoundTrip(t *testing.T) {
+	resp := kmsg.NewMetadataResponse()
+	resp.SetVersion(12)
+
+	// fill sample broker and topic like server does
+	resp.Brokers = []kmsg.MetadataResponseBroker{{NodeID: 1, Host: "127.0.0.1", Port: 19092}}
+	clusterID := "kafka-server-cluster"
+	resp.ClusterID = &clusterID
+	resp.ControllerID = 1
+
+	resp.Topics = []kmsg.MetadataResponseTopic{
+		{
+			Topic:      kmsg.StringPtr("test-topic"),
+			ErrorCode:  0,
+			Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 1, Replicas: []int32{1}, ISR: []int32{1}, ErrorCode: 0}},
+		},
+	}
+
+	// Build buffer as sendResponse would (correlation id + message bytes)
+	buf := kbin.AppendInt32(nil, 123)
+	buf = resp.AppendTo(buf)
+
+	// Now parse back after skipping correlation id
+	parsed := kmsg.NewMetadataResponse()
+	parsed.SetVersion(12)
+	if err := parsed.ReadFrom(buf[4:]); err != nil {
+		t.Fatalf("metadata response failed to parse: %v", err)
+	}
 }
