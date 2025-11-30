@@ -262,7 +262,6 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 		k.connWG.Done()
 	}()
 
-	fmt.Printf("DEBUG: Accepted connection from %s\n", conn.RemoteAddr())
 	k.logger.Debugf("Accepted connection from %s", conn.RemoteAddr())
 
 	for {
@@ -301,22 +300,17 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 			return
 		}
 
-		fmt.Printf("DEBUG: Read request of size %d\n", size)
-
 		// Parse and handle request
 		if err := k.handleRequest(conn, requestData); err != nil {
-			fmt.Printf("DEBUG: Failed to handle request: %v\n", err)
 			k.logger.Errorf("Failed to handle request: %v", err)
 			return
 		}
-		fmt.Printf("DEBUG: Successfully handled request\n")
 	}
 }
 
 func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	// Parse request header using kmsg types
 	if len(data) < 8 {
-		fmt.Printf("DEBUG: Request too small: %d bytes\n", len(data))
 		k.logger.Errorf("Request too small: %d bytes", len(data))
 		return fmt.Errorf("request too small: %d bytes", len(data))
 	}
@@ -696,32 +690,47 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 			break
 		}
 
-		// Read the varint length prefix to know how many bytes this record occupies
-		recordLen, lenBytes := kbin.Varint(recordsData[offset:])
-		if lenBytes == 0 {
-			k.logger.Warnf("Failed to read varint length for record %d", i)
-			break
-		}
-		fmt.Printf("DEBUG: Record %d has length varint: %d bytes, recordLen=%d\n", i, lenBytes, recordLen)
-		offset += lenBytes
+		var recordData []byte
+		var recordLen int
 
-		if offset+int(recordLen) > len(recordsData) {
-			k.logger.Warnf("Record %d extends beyond available data: offset=%d, recordLen=%d, available=%d", i, offset, recordLen, len(recordsData))
-			break
+		// When there's only 1 record, it seems to not have a length prefix
+		// When there are multiple records, each has a varint length prefix
+		if recordBatch.NumRecords == 1 {
+			// Single record - use all remaining data
+			recordData = recordsData[offset:]
+			recordLen = len(recordData)
+			fmt.Printf("DEBUG: Single record mode - using all %d bytes\n", recordLen)
+		} else {
+			// Multiple records - read the varint length prefix
+			lenBytesConsumed := 0
+			recordLen32, lenBytesConsumed := kbin.Varint(recordsData[offset:])
+			if lenBytesConsumed == 0 {
+				k.logger.Warnf("Failed to read varint length for record %d", i)
+				break
+			}
+			recordLen = int(recordLen32)
+			fmt.Printf("DEBUG: Record %d has length varint: %d bytes, recordLen=%d\n", i, lenBytesConsumed, recordLen)
+			offset += lenBytesConsumed
+
+			if offset+recordLen > len(recordsData) {
+				k.logger.Warnf("Record %d extends beyond available data: offset=%d, recordLen=%d, available=%d", i, offset, recordLen, len(recordsData))
+				break
+			}
+
+			recordData = recordsData[offset : offset+recordLen]
 		}
 
-		// Parse the record - ReadFrom expects just the record data without length prefix
+		// Parse the record
 		record := kmsg.NewRecord()
-		recordData := recordsData[offset : offset+int(recordLen)]
 		fmt.Printf("DEBUG: Parsing record %d from %d bytes, hex: %x\n", i, len(recordData), recordData[:min(10, len(recordData))])
 		if err := record.ReadFrom(recordData); err != nil {
 			fmt.Printf("DEBUG: Failed to parse record %d: %v\n", i, err)
 			k.logger.Warnf("Failed to parse record %d: %v", i, err)
-			offset += int(recordLen) // Skip this bad record
+			offset += recordLen // Skip this bad record
 			continue
 		}
 
-		offset += int(recordLen)
+		offset += recordLen
 
 		// Calculate absolute timestamp
 		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
