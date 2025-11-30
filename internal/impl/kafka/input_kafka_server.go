@@ -321,12 +321,12 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	apiVersion := b.Int16()
 	correlationID := b.Int32()
 
-	fmt.Printf("DEBUG: Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d\n", apiKey, apiVersion, correlationID, len(data))
+	k.logger.Debugf("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
 	dumpLen := 30
 	if len(data) < 30 {
 		dumpLen = len(data)
 	}
-	fmt.Printf("DEBUG: First %d bytes (hex): %x\n", dumpLen, data[:dumpLen])
+	k.logger.Debugf("First %d bytes (hex): %x", dumpLen, data[:dumpLen])
 	k.logger.Infof("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
 
 	// Determine if flexible request (v3+ for ApiVersions, v9+ for others)
@@ -364,7 +364,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	// Now b is positioned at the start of the request body
 	offset := len(data) - len(b.Src)
 
-	fmt.Printf("DEBUG: Request body from offset %d (isFlexible=%v): %x\n", offset, isFlexible, data[offset:min(offset+20, len(data))])
+	k.logger.Debugf("Request body from offset %d (isFlexible=%v): %x", offset, isFlexible, data[offset:min(offset+20, len(data))])
 
 	k.logger.Infof("Handling request: apiKey=%d", apiKey)
 
@@ -372,7 +372,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	switch apiKey {
 	case 18: // ApiVersions
 		// ApiVersions request has minimal/no body
-		fmt.Printf("DEBUG: Handling ApiVersions\n")
+		k.logger.Debugf("Handling ApiVersions")
 		resp := kmsg.NewApiVersionsResponse()
 		resp.SetVersion(apiVersion)
 		err = k.handleApiVersionsReq(conn, correlationID, nil, &resp)
@@ -386,11 +386,11 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		k.parseMu.Unlock()
 
 		if parseErr != nil {
-			fmt.Printf("DEBUG: ReadFrom FAILED for Metadata: %v\n", parseErr)
+			k.logger.Debugf("ReadFrom FAILED for Metadata: %v", parseErr)
 			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, 2)
 		} else {
-			fmt.Printf("DEBUG: ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d\n", offset, len(req.Topics))
+			k.logger.Debugf("ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d", offset, len(req.Topics))
 			resp := kmsg.NewMetadataResponse()
 			resp.SetVersion(apiVersion)
 			err = k.handleMetadataReq(conn, correlationID, &req, &resp)
@@ -399,14 +399,14 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		// Parse produce request body (after header)
 		req := kmsg.NewProduceRequest()
 		req.SetVersion(apiVersion)
-		fmt.Printf("DEBUG: About to call ReadFrom for Produce, body size=%d (offset=%d)\n", len(data[offset:]), offset)
+		k.logger.Debugf("About to call ReadFrom for Produce, body size=%d (offset=%d)", len(data[offset:]), offset)
 
 		k.parseMu.Lock()
 		parseErr := req.ReadFrom(data[offset:])
 		k.parseMu.Unlock()
 
 		if parseErr != nil {
-			fmt.Printf("DEBUG: ReadFrom failed: %v\n", parseErr)
+			k.logger.Debugf("ReadFrom failed: %v", parseErr)
 			k.logger.Errorf("Failed to parse ProduceRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, 2)
 		} else {
@@ -429,7 +429,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 }
 
 func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int32, req *kmsg.ApiVersionsRequest, resp *kmsg.ApiVersionsResponse) error {
-	fmt.Printf("DEBUG: handleApiVersionsReq called\n")
+	k.logger.Debugf("handleApiVersionsReq called")
 
 	resp.ErrorCode = 0
 
@@ -441,27 +441,27 @@ func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int
 		{ApiKey: 0, MinVersion: 0, MaxVersion: 9},  // Produce (support up to v9)
 	}
 
-	fmt.Printf("DEBUG: About to send ApiVersions response\n")
+	k.logger.Debugf("About to send ApiVersions response")
 	return k.sendResponse(conn, correlationID, resp)
 }
 
 func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, correlationID int32, req *kmsg.MetadataRequest, resp *kmsg.MetadataResponse) error {
 
 	k.logger.Infof("Metadata request: correlationID=%d, topics count=%d, AllowAutoTopicCreation=%v", correlationID, len(req.Topics), req.AllowAutoTopicCreation)
-	fmt.Printf("DEBUG: Metadata request: topics count=%d, AllowAutoTopicCreation=%v, IncludeTopicAuthorizedOperations=%v\n",
+	k.logger.Debugf("Metadata request: topics count=%d, AllowAutoTopicCreation=%v, IncludeTopicAuthorizedOperations=%v",
 		len(req.Topics), req.AllowAutoTopicCreation, req.IncludeTopicAuthorizedOperations)
 
 	// Extract requested topics
 	var requestedTopics []string
 	for i, t := range req.Topics {
-		fmt.Printf("DEBUG: Topic[%d]: Topic=%v, TopicID=%v\n", i, t.Topic, t.TopicID)
+		k.logger.Debugf("Topic[%d]: Topic=%v, TopicID=%v", i, t.Topic, t.TopicID)
 		if t.Topic != nil {
 			requestedTopics = append(requestedTopics, *t.Topic)
 			k.logger.Debugf("Client requested topic: %s", *t.Topic)
 		}
 	}
 
-	fmt.Printf("DEBUG: Requested topics: %v\n", requestedTopics)
+	k.logger.Debugf("Requested topics: %v", requestedTopics)
 
 	// Add a single broker (ourselves)
 	// Parse host and port from address
@@ -556,7 +556,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	for _, topic := range req.Topics {
 		topicName := topic.Topic
 		k.logger.Infof("Processing topic: %s, partitions=%d", topicName, len(topic.Partitions))
-		fmt.Printf("DEBUG: Processing topic: %s, partitions=%d\n", topicName, len(topic.Partitions))
+		k.logger.Debugf("Processing topic: %s, partitions=%d", topicName, len(topic.Partitions))
 
 		// Check if topic is allowed
 		if k.allowedTopics != nil {
@@ -568,36 +568,36 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 
 		// Iterate through partitions
 		for i, partition := range topic.Partitions {
-			fmt.Printf("DEBUG: Partition %d: Records=%v, len=%d\n", i, partition.Records != nil, len(partition.Records))
+			k.logger.Debugf("Partition %d: Records=%v, len=%d", i, partition.Records != nil, len(partition.Records))
 			if partition.Records == nil || len(partition.Records) == 0 {
-				fmt.Printf("DEBUG: Skipping partition %d (empty records)\n", i)
+				k.logger.Debugf("Skipping partition %d (empty records)", i)
 				continue
 			}
 
 			// Parse records from the record batch
-			fmt.Printf("DEBUG: About to parse record batch for partition %d\n", i)
+			k.logger.Debugf("About to parse record batch for partition %d", i)
 			messages, err := k.parseRecordBatch(partition.Records, topicName, partition.Partition, remoteAddr)
 			if err != nil {
-				fmt.Printf("DEBUG: Failed to parse record batch: %v\n", err)
+				k.logger.Debugf("Failed to parse record batch: %v", err)
 				k.logger.Errorf("Failed to parse record batch: %v", err)
 				continue
 			}
-			fmt.Printf("DEBUG: Parsed %d messages from partition %d\n", len(messages), i)
+			k.logger.Debugf("Parsed %d messages from partition %d", len(messages), i)
 
 			batch = append(batch, messages...)
 		}
 	}
 
-	fmt.Printf("DEBUG: Total batch size: %d messages\n", len(batch))
+	k.logger.Debugf("Total batch size: %d messages", len(batch))
 	// If no messages, send success
 	if len(batch) == 0 {
-		fmt.Printf("DEBUG: Sending empty response (no messages)\n")
+		k.logger.Debugf("Sending empty response (no messages)")
 		return k.sendResponse(conn, correlationID, resp)
 	}
 
 	// Send batch to pipeline
 	resChan := make(chan error, 1)
-	fmt.Printf("DEBUG: Sending batch to pipeline, acks=%d\n", req.Acks)
+	k.logger.Debugf("Sending batch to pipeline, acks=%d", req.Acks)
 	select {
 	case k.msgChan <- messageBatch{
 		batch: batch,
@@ -607,9 +607,9 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		},
 		resChan: resChan,
 	}:
-		fmt.Printf("DEBUG: Successfully sent batch to pipeline\n")
+		k.logger.Debugf("Successfully sent batch to pipeline")
 	case <-time.After(k.timeout):
-		fmt.Printf("DEBUG: Timeout sending batch to pipeline\n")
+		k.logger.Debugf("Timeout sending batch to pipeline")
 		resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
 			Topic: req.Topics[0].Topic,
 			Partitions: []kmsg.ProduceResponseTopicPartition{
@@ -622,9 +622,9 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	}
 
 	// Wait for acknowledgment if acks != 0 (acks can be -1 for "all", 1 for "leader")
-	fmt.Printf("DEBUG: Checking acks: req.Acks=%d\n", req.Acks)
+	k.logger.Debugf("Checking acks: req.Acks=%d", req.Acks)
 	if req.Acks != 0 {
-		fmt.Printf("DEBUG: Waiting for acknowledgment (acks != 0)\n")
+		k.logger.Debugf("Waiting for acknowledgment (acks != 0)")
 		select {
 		case err := <-resChan:
 			// Build response for all topics/partitions that were in the request
@@ -669,7 +669,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		return nil, fmt.Errorf("failed to parse record batch: %w", err)
 	}
 
-	fmt.Printf("DEBUG: RecordBatch has %d records, Attributes=0x%x, Records len=%d\n", recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
+	k.logger.Debugf("RecordBatch has %d records, Attributes=0x%x, Records len=%d", recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
 
 	// Check for compression (lower 3 bits of Attributes)
 	compression := recordBatch.Attributes & 0x07
@@ -684,7 +684,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 	offset := 0
 
 	for i := 0; i < int(recordBatch.NumRecords); i++ {
-		fmt.Printf("DEBUG: Parsing record %d/%d, offset=%d, recordsDataLen=%d\n", i+1, recordBatch.NumRecords, offset, len(recordsData))
+		k.logger.Debugf("Parsing record %d/%d, offset=%d, recordsDataLen=%d", i+1, recordBatch.NumRecords, offset, len(recordsData))
 		if offset >= len(recordsData) {
 			k.logger.Warnf("Reached end of data while parsing record %d/%d", i, recordBatch.NumRecords)
 			break
@@ -699,7 +699,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 			// Single record - use all remaining data
 			recordData = recordsData[offset:]
 			recordLen = len(recordData)
-			fmt.Printf("DEBUG: Single record mode - using all %d bytes\n", recordLen)
+			k.logger.Debugf("Single record mode - using all %d bytes", recordLen)
 		} else {
 			// Multiple records - read the varint length prefix
 			lenBytesConsumed := 0
@@ -709,7 +709,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 				break
 			}
 			recordLen = int(recordLen32)
-			fmt.Printf("DEBUG: Record %d has length varint: %d bytes, recordLen=%d\n", i, lenBytesConsumed, recordLen)
+			k.logger.Debugf("Record %d has length varint: %d bytes, recordLen=%d", i, lenBytesConsumed, recordLen)
 			offset += lenBytesConsumed
 
 			if offset+recordLen > len(recordsData) {
@@ -722,9 +722,9 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 
 		// Parse the record
 		record := kmsg.NewRecord()
-		fmt.Printf("DEBUG: Parsing record %d from %d bytes, hex: %x\n", i, len(recordData), recordData[:min(10, len(recordData))])
+		k.logger.Debugf("Parsing record %d from %d bytes, hex: %x", i, len(recordData), recordData[:min(10, len(recordData))])
 		if err := record.ReadFrom(recordData); err != nil {
-			fmt.Printf("DEBUG: Failed to parse record %d: %v\n", i, err)
+			k.logger.Debugf("Failed to parse record %d: %v", i, err)
 			k.logger.Warnf("Failed to parse record %d: %v", i, err)
 			offset += recordLen // Skip this bad record
 			continue
@@ -739,7 +739,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		msg := service.NewMessage(record.Value)
 		msg.MetaSetMut("kafka_server_topic", topic)
 		msg.MetaSetMut("kafka_server_partition", partition)
-		fmt.Printf("DEBUG: Set partition metadata: value=%v, type=%T\n", partition, partition)
+		k.logger.Debugf("Set partition metadata: value=%v, type=%T", partition, partition)
 		msg.MetaSetMut("kafka_server_offset", recordBatch.FirstOffset+int64(record.OffsetDelta))
 
 		if record.Key != nil {
@@ -798,10 +798,10 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg 
 	// AppendTo generates the response body
 	buf = msg.AppendTo(buf)
 
-	fmt.Printf("DEBUG: sendResponse: correlationID=%d, flexible=%v, key=%d, total_size=%d\n", correlationID, msg.IsFlexible(), msg.Key(), len(buf))
+	k.logger.Debugf("sendResponse: correlationID=%d, flexible=%v, key=%d, total_size=%d", correlationID, msg.IsFlexible(), msg.Key(), len(buf))
 
-	fmt.Printf("DEBUG: Sending response: correlationID=%d, size=%d bytes, flexible=%v\n", correlationID, len(buf), msg.IsFlexible())
-	fmt.Printf("DEBUG: Full response hex: %x\n", buf)
+	k.logger.Debugf("Sending response: correlationID=%d, size=%d bytes, flexible=%v", correlationID, len(buf), msg.IsFlexible())
+	k.logger.Debugf("Full response hex: %x", buf)
 	k.logger.Infof("Sending response: correlationID=%d, size=%d bytes, flexible=%v", correlationID, len(buf), msg.IsFlexible())
 
 	return k.writeResponse(conn, buf)
@@ -810,7 +810,7 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg 
 func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 	// Write size
 	size := int32(len(data))
-	fmt.Printf("DEBUG: writeResponse: size=%d, data len=%d, first 20 bytes hex=%x\n", size, len(data), data[:min(20, len(data))])
+	k.logger.Debugf("writeResponse: size=%d, data len=%d, first 20 bytes hex=%x", size, len(data), data[:min(20, len(data))])
 	k.logger.Debugf("Writing response size: %d", size)
 	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
 		k.logger.Errorf("Failed to write response size: %v", err)
@@ -823,7 +823,7 @@ func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 		k.logger.Errorf("Failed to write response data: %v", err)
 		return err
 	}
-	fmt.Printf("DEBUG: wrote %d bytes out of %d\n", n, len(data))
+	k.logger.Debugf("wrote %d bytes out of %d", n, len(data))
 	k.logger.Debugf("Wrote %d bytes of response data", n)
 	return nil
 }
