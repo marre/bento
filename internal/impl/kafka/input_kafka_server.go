@@ -14,6 +14,7 @@ import (
 
 	"github.com/Jeffail/shutdown"
 	"github.com/twmb/franz-go/pkg/kbin"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -331,12 +332,12 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 
 	// Determine if flexible request (v3+ for ApiVersions, v9+ for others)
 	isFlexible := false
-	switch apiKey {
-	case 18: // ApiVersions
+	switch kmsg.Key(apiKey) {
+	case kmsg.ApiVersions:
 		isFlexible = apiVersion >= 3
-	case 3: // Metadata
+	case kmsg.Metadata:
 		isFlexible = apiVersion >= 9
-	case 0: // Produce
+	case kmsg.Produce:
 		isFlexible = apiVersion >= 9
 	}
 
@@ -369,14 +370,14 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	k.logger.Infof("Handling request: apiKey=%d", apiKey)
 
 	var err error
-	switch apiKey {
-	case 18: // ApiVersions
+	switch kmsg.Key(apiKey) {
+	case kmsg.ApiVersions:
 		// ApiVersions request has minimal/no body
 		k.logger.Debugf("Handling ApiVersions")
 		resp := kmsg.NewApiVersionsResponse()
 		resp.SetVersion(apiVersion)
 		err = k.handleApiVersionsReq(conn, correlationID, nil, &resp)
-	case 3: // Metadata
+	case kmsg.Metadata:
 		// Parse metadata request body (after header)
 		req := kmsg.NewMetadataRequest()
 		req.SetVersion(apiVersion)
@@ -388,14 +389,14 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		if parseErr != nil {
 			k.logger.Debugf("ReadFrom FAILED for Metadata: %v", parseErr)
 			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
-			err = k.sendErrorResponse(conn, correlationID, 2)
+			err = k.sendErrorResponse(conn, correlationID, kerr.UnknownServerError.Code)
 		} else {
 			k.logger.Debugf("ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d", offset, len(req.Topics))
 			resp := kmsg.NewMetadataResponse()
 			resp.SetVersion(apiVersion)
 			err = k.handleMetadataReq(conn, correlationID, &req, &resp)
 		}
-	case 0: // Produce
+	case kmsg.Produce:
 		// Parse produce request body (after header)
 		req := kmsg.NewProduceRequest()
 		req.SetVersion(apiVersion)
@@ -408,7 +409,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		if parseErr != nil {
 			k.logger.Debugf("ReadFrom failed: %v", parseErr)
 			k.logger.Errorf("Failed to parse ProduceRequest: %v", parseErr)
-			err = k.sendErrorResponse(conn, correlationID, 2)
+			err = k.sendErrorResponse(conn, correlationID, kerr.UnknownServerError.Code)
 		} else {
 			resp := kmsg.NewProduceResponse()
 			resp.SetVersion(apiVersion)
@@ -416,7 +417,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		}
 	default:
 		k.logger.Warnf("Unsupported API key: %d", apiKey)
-		err = k.sendErrorResponse(conn, correlationID, 35)
+		err = k.sendErrorResponse(conn, correlationID, kerr.UnsupportedVersion.Code)
 	}
 
 	if err != nil {
@@ -436,9 +437,9 @@ func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int
 	// Advertise support for ApiVersions, Metadata, and Produce
 	// We support flexible versions for all APIs
 	resp.ApiKeys = []kmsg.ApiVersionsResponseApiKey{
-		{ApiKey: 18, MinVersion: 0, MaxVersion: 3}, // ApiVersions (we handle v3 flexible)
-		{ApiKey: 3, MinVersion: 0, MaxVersion: 12}, // Metadata (support up to v12)
-		{ApiKey: 0, MinVersion: 0, MaxVersion: 9},  // Produce (support up to v9)
+		{ApiKey: int16(kmsg.ApiVersions), MinVersion: 0, MaxVersion: 3}, // ApiVersions (we handle v3 flexible)
+		{ApiKey: int16(kmsg.Metadata), MinVersion: 0, MaxVersion: 12},   // Metadata (support up to v12)
+		{ApiKey: int16(kmsg.Produce), MinVersion: 0, MaxVersion: 9},     // Produce (support up to v9)
 	}
 
 	k.logger.Debugf("About to send ApiVersions response")
@@ -518,7 +519,7 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, correlationID int32,
 				// Topic not allowed, return with error code
 				resp.Topics = append(resp.Topics, kmsg.MetadataResponseTopic{
 					Topic:     kmsg.StringPtr(topic),
-					ErrorCode: 3, // UNKNOWN_TOPIC_OR_PARTITION
+					ErrorCode: kerr.UnknownTopicOrPartition.Code,
 				})
 				continue
 			}
@@ -569,7 +570,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		// Iterate through partitions
 		for i, partition := range topic.Partitions {
 			k.logger.Debugf("Partition %d: Records=%v, len=%d", i, partition.Records != nil, len(partition.Records))
-			if partition.Records == nil || len(partition.Records) == 0 {
+			if len(partition.Records) == 0 {
 				k.logger.Debugf("Skipping partition %d (empty records)", i)
 				continue
 			}
@@ -613,7 +614,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
 			Topic: req.Topics[0].Topic,
 			Partitions: []kmsg.ProduceResponseTopicPartition{
-				{Partition: 0, ErrorCode: 7}, // REQUEST_TIMED_OUT
+				{Partition: 0, ErrorCode: kerr.RequestTimedOut.Code},
 			},
 		})
 		return k.sendResponse(conn, correlationID, resp)
@@ -633,9 +634,9 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 					Topic: topic.Topic,
 				}
 				for _, partition := range topic.Partitions {
-					errorCode := int16(0) // Success
+					errorCode := int16(0)
 					if err != nil {
-						errorCode = 2 // UNKNOWN_SERVER_ERROR
+						errorCode = kerr.UnknownServerError.Code
 					}
 					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
 						Partition:      partition.Partition,
@@ -651,7 +652,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 			resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
 				Topic: req.Topics[0].Topic,
 				Partitions: []kmsg.ProduceResponseTopicPartition{
-					{Partition: 0, ErrorCode: 7}, // REQUEST_TIMED_OUT
+					{Partition: 0, ErrorCode: kerr.RequestTimedOut.Code},
 				},
 			})
 		case <-k.shutdownCh:
@@ -791,7 +792,7 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg 
 
 	// For flexible responses (EXCEPT ApiVersions key 18), add response header TAG_BUFFER
 	// This matches the kfake implementation in franz-go
-	if msg.IsFlexible() && msg.Key() != 18 {
+	if msg.IsFlexible() && msg.Key() != int16(kmsg.ApiVersions) {
 		buf = append(buf, 0) // Empty TAG_BUFFER (0 tags)
 	}
 

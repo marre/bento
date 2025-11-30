@@ -437,6 +437,149 @@ address: "127.0.0.1:19096"
 	require.NoError(t, err)
 }
 
+func TestKafkaServerInputAcks0(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19097"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19097"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Produce message with acks=0 (NoResponse)
+	record := &kgo.Record{
+		Topic: "test-topic",
+		Value: []byte("test-value-acks-0"),
+	}
+
+	// We can't easily force kgo to use acks=0 per record, but we can configure the client
+	// However, for this test we want to verify the server handles it.
+	// The franz-go client defaults to acks=all.
+	// To test acks=0, we might need to construct a raw request or configure the client.
+	// kgo.RequiredAcks(kgo.NoAck())
+
+	clientAcks0, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19097"),
+		kgo.RequiredAcks(kgo.NoAck()),
+		kgo.DisableIdempotentWrite(),
+	)
+	require.NoError(t, err)
+	defer clientAcks0.Close()
+
+	done := make(chan struct{})
+	go func() {
+		// ProduceAsync with NoAck should return immediately
+		clientAcks0.Produce(ctx, record, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - produce returned
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for produce with acks=0")
+	}
+
+	// Read message
+	batch, ackFn, err := input.ReadBatch(ctx)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msgBytes, err := batch[0].AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, "test-value-acks-0", string(msgBytes))
+
+	err = ackFn(ctx, nil)
+	require.NoError(t, err)
+}
+
+func TestKafkaServerInputAcks1(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19098"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Configure client for acks=1 (LeaderAck)
+	clientAcks1, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19098"),
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.DisableIdempotentWrite(),
+	)
+	require.NoError(t, err)
+	defer clientAcks1.Close()
+
+	record := &kgo.Record{
+		Topic: "test-topic",
+		Value: []byte("test-value-acks-1"),
+	}
+
+	produceChan := make(chan error, 1)
+	go func() {
+		results := clientAcks1.ProduceSync(ctx, record)
+		if len(results) > 0 {
+			produceChan <- results[0].Err
+		}
+	}()
+
+	// Read message
+	batch, ackFn, err := input.ReadBatch(ctx)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msgBytes, err := batch[0].AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, "test-value-acks-1", string(msgBytes))
+
+	// Acknowledge the message
+	err = ackFn(ctx, nil)
+	require.NoError(t, err)
+
+	// Verify producer received acknowledgment
+	select {
+	case err := <-produceChan:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for produce acknowledgment")
+	}
+}
+
 // Quick round-trip test: ensure the metadata response we construct can be
 // appended-to a buffer and parsed back by kmsg to avoid the 'not enough
 // data' errors the client observed in integration tests.
