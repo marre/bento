@@ -696,26 +696,28 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 			break
 		}
 
-		// Read the varint length prefix
+		// Read the varint length prefix to know how many bytes this record occupies
 		recordLen, lenBytes := kbin.Varint(recordsData[offset:])
 		if lenBytes == 0 {
-			k.logger.Warnf("Failed to read length varint for record %d", i)
+			k.logger.Warnf("Failed to read varint length for record %d", i)
 			break
 		}
-		fmt.Printf("DEBUG: Record %d length prefix: %d bytes (recordLen=%d)\n", i, lenBytes, recordLen)
+		fmt.Printf("DEBUG: Record %d has length varint: %d bytes, recordLen=%d\n", i, lenBytes, recordLen)
 		offset += lenBytes
 
 		if offset+int(recordLen) > len(recordsData) {
-			k.logger.Warnf("Record %d extends beyond data bounds: offset=%d, recordLen=%d, dataLen=%d", i, offset, recordLen, len(recordsData))
+			k.logger.Warnf("Record %d extends beyond available data: offset=%d, recordLen=%d, available=%d", i, offset, recordLen, len(recordsData))
 			break
 		}
 
-		// Parse the record from the exact slice
+		// Parse the record - ReadFrom expects just the record data without length prefix
 		record := kmsg.NewRecord()
-		if err := record.ReadFrom(recordsData[offset : offset+int(recordLen)]); err != nil {
+		recordData := recordsData[offset : offset+int(recordLen)]
+		fmt.Printf("DEBUG: Parsing record %d from %d bytes, hex: %x\n", i, len(recordData), recordData[:min(10, len(recordData))])
+		if err := record.ReadFrom(recordData); err != nil {
 			fmt.Printf("DEBUG: Failed to parse record %d: %v\n", i, err)
 			k.logger.Warnf("Failed to parse record %d: %v", i, err)
-			offset += int(recordLen) // Skip this record
+			offset += int(recordLen) // Skip this bad record
 			continue
 		}
 
