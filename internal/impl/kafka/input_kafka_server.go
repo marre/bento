@@ -323,12 +323,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	correlationID := b.Int32()
 
 	k.logger.Debugf("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
-	dumpLen := 30
-	if len(data) < 30 {
-		dumpLen = len(data)
-	}
-	k.logger.Debugf("First %d bytes (hex): %x", dumpLen, data[:dumpLen])
-	k.logger.Infof("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
 
 	// Determine if flexible request (v3+ for ApiVersions, v9+ for others)
 	isFlexible := false
@@ -366,8 +360,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	offset := len(data) - len(b.Src)
 
 	k.logger.Debugf("Request body from offset %d (isFlexible=%v): %x", offset, isFlexible, data[offset:min(offset+20, len(data))])
-
-	k.logger.Infof("Handling request: apiKey=%d", apiKey)
 
 	var err error
 	switch kmsg.Key(apiKey) {
@@ -420,12 +412,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		err = k.sendErrorResponse(conn, correlationID, kerr.UnsupportedVersion.Code)
 	}
 
-	if err != nil {
-		k.logger.Errorf("Error handling request (apiKey=%d): %v", apiKey, err)
-	} else {
-		k.logger.Infof("Successfully handled request (apiKey=%d, correlationID=%d)", apiKey, correlationID)
-	}
-
 	return err
 }
 
@@ -448,17 +434,14 @@ func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int
 
 func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, correlationID int32, req *kmsg.MetadataRequest, resp *kmsg.MetadataResponse) error {
 
-	k.logger.Infof("Metadata request: correlationID=%d, topics count=%d, AllowAutoTopicCreation=%v", correlationID, len(req.Topics), req.AllowAutoTopicCreation)
 	k.logger.Debugf("Metadata request: topics count=%d, AllowAutoTopicCreation=%v, IncludeTopicAuthorizedOperations=%v",
 		len(req.Topics), req.AllowAutoTopicCreation, req.IncludeTopicAuthorizedOperations)
 
 	// Extract requested topics
 	var requestedTopics []string
-	for i, t := range req.Topics {
-		k.logger.Debugf("Topic[%d]: Topic=%v, TopicID=%v", i, t.Topic, t.TopicID)
+	for _, t := range req.Topics {
 		if t.Topic != nil {
 			requestedTopics = append(requestedTopics, *t.Topic)
-			k.logger.Debugf("Client requested topic: %s", *t.Topic)
 		}
 	}
 
@@ -556,7 +539,6 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	// Iterate through topics using kmsg's typed structures
 	for _, topic := range req.Topics {
 		topicName := topic.Topic
-		k.logger.Infof("Processing topic: %s, partitions=%d", topicName, len(topic.Partitions))
 		k.logger.Debugf("Processing topic: %s, partitions=%d", topicName, len(topic.Partitions))
 
 		// Check if topic is allowed
@@ -761,24 +743,6 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 	return batch, nil
 }
 
-func (k *kafkaServerInput) sendProduceResponse(conn net.Conn, correlationID int32, version int16, acks int16) error {
-	resp := kmsg.NewProduceResponse()
-	resp.Version = version
-
-	// Empty response indicating success
-	return k.sendResponse(conn, correlationID, &resp)
-}
-
-func (k *kafkaServerInput) sendProduceErrorResponse(conn net.Conn, correlationID int32, version int16, errorCode int16) error {
-	resp := kmsg.NewProduceResponse()
-	resp.Version = version
-
-	// Add error code to response
-	// Note: Proper error handling would set this per topic/partition
-
-	return k.sendResponse(conn, correlationID, &resp)
-}
-
 func (k *kafkaServerInput) sendErrorResponse(conn net.Conn, correlationID int32, errorCode int16) error {
 	// Generic error response
 	buf := kbin.AppendInt32(nil, correlationID)
@@ -801,18 +765,12 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, correlationID int32, msg 
 
 	k.logger.Debugf("sendResponse: correlationID=%d, flexible=%v, key=%d, total_size=%d", correlationID, msg.IsFlexible(), msg.Key(), len(buf))
 
-	k.logger.Debugf("Sending response: correlationID=%d, size=%d bytes, flexible=%v", correlationID, len(buf), msg.IsFlexible())
-	k.logger.Debugf("Full response hex: %x", buf)
-	k.logger.Infof("Sending response: correlationID=%d, size=%d bytes, flexible=%v", correlationID, len(buf), msg.IsFlexible())
-
 	return k.writeResponse(conn, buf)
 }
 
 func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 	// Write size
 	size := int32(len(data))
-	k.logger.Debugf("writeResponse: size=%d, data len=%d, first 20 bytes hex=%x", size, len(data), data[:min(20, len(data))])
-	k.logger.Debugf("Writing response size: %d", size)
 	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
 		k.logger.Errorf("Failed to write response size: %v", err)
 		return err
@@ -824,8 +782,7 @@ func (k *kafkaServerInput) writeResponse(conn net.Conn, data []byte) error {
 		k.logger.Errorf("Failed to write response data: %v", err)
 		return err
 	}
-	k.logger.Debugf("wrote %d bytes out of %d", n, len(data))
-	k.logger.Debugf("Wrote %d bytes of response data", n)
+	k.logger.Debugf("Wrote response: %d bytes", n)
 	return nil
 }
 
