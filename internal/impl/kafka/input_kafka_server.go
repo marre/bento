@@ -1,6 +1,8 @@
 package kafka
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -13,10 +15,13 @@ import (
 	"time"
 
 	"github.com/Jeffail/shutdown"
+	"github.com/golang/snappy"
+	"github.com/pierrec/lz4/v4"
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/warpstreamlabs/bento/public/service"
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -26,6 +31,16 @@ const (
 	ksfFieldSASL            = "sasl"
 	ksfFieldTimeout         = "timeout"
 	ksfFieldMaxMessageBytes = "max_message_bytes"
+)
+
+// Kafka compression codec values as defined in the Kafka protocol specification.
+// These match franz-go's internal codecType constants.
+const (
+	codecNone   int8 = 0
+	codecGzip   int8 = 1
+	codecSnappy int8 = 2
+	codecLZ4    int8 = 3
+	codecZstd   int8 = 4
 )
 
 func min(a, b int) int {
@@ -645,6 +660,39 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 	return k.sendResponse(conn, correlationID, resp)
 }
 
+// decompressRecords decompresses Kafka record data based on the compression codec
+func decompressRecords(data []byte, codec int8) ([]byte, error) {
+	switch codec {
+	case codecNone:
+		return data, nil
+	case codecGzip:
+		reader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer reader.Close()
+		return io.ReadAll(reader)
+	case codecSnappy:
+		decoded, err := snappy.Decode(nil, data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode snappy: %w", err)
+		}
+		return decoded, nil
+	case codecLZ4:
+		reader := lz4.NewReader(bytes.NewReader(data))
+		return io.ReadAll(reader)
+	case codecZstd:
+		decoder, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd reader: %w", err)
+		}
+		defer decoder.Close()
+		return io.ReadAll(decoder)
+	default:
+		return nil, fmt.Errorf("unsupported compression codec: %d", codec)
+	}
+}
+
 func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
 	// Use kmsg.RecordBatch to parse the batch header
 	recordBatch := kmsg.RecordBatch{}
@@ -655,15 +703,23 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 	k.logger.Debugf("RecordBatch has %d records, Attributes=0x%x, Records len=%d", recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
 
 	// Check for compression (lower 3 bits of Attributes)
-	compression := recordBatch.Attributes & 0x07
-	if compression != 0 {
-		return nil, fmt.Errorf("compressed records not yet supported (compression type=%d)", compression)
+	compression := int8(recordBatch.Attributes & 0x07)
+
+	// Decompress records if needed
+	recordsData := recordBatch.Records
+	if compression != codecNone {
+		k.logger.Debugf("Decompressing records with codec %d", compression)
+		decompressed, err := decompressRecords(recordsData, compression)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress records: %w", err)
+		}
+		recordsData = decompressed
+		k.logger.Debugf("Decompressed %d bytes to %d bytes", len(recordBatch.Records), len(recordsData))
 	}
 
 	var batch service.MessageBatch
 
 	// Parse individual records from the Records byte array
-	recordsData := recordBatch.Records
 	offset := 0
 
 	for i := 0; i < int(recordBatch.NumRecords); i++ {

@@ -644,3 +644,92 @@ func TestMetadataResponseRoundTrip(t *testing.T) {
 		require.Equal(t, "test-topic", *parsed.Topics[0].Topic, "topic name")
 	}
 }
+
+func TestKafkaServerInputCompression(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19097"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create producer with Snappy compression (default when batching)
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19097"),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Produce multiple compressed messages
+	numMessages := 5
+	testTopic := "compressed-test"
+
+	for i := 0; i < numMessages; i++ {
+		record := &kgo.Record{
+			Topic: testTopic,
+			Key:   []byte(fmt.Sprintf("key-%d", i)),
+			Value: []byte(fmt.Sprintf("value-%d", i)),
+		}
+
+		go func() {
+			client.Produce(ctx, record, func(r *kgo.Record, err error) {
+				// Callback
+			})
+		}()
+	}
+
+	// Read messages
+	receivedCount := 0
+	timeout := time.After(10 * time.Second)
+
+	for receivedCount < numMessages {
+		select {
+		case <-timeout:
+			t.Fatalf("Timeout: only received %d of %d compressed messages", receivedCount, numMessages)
+		default:
+			readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+			batch, ackFn, err := input.ReadBatch(readCtx)
+			readCancel()
+
+			if err != nil {
+				if err == context.DeadlineExceeded {
+					continue
+				}
+				t.Fatalf("Failed to read batch: %v", err)
+			}
+
+			receivedCount += len(batch)
+
+			// Verify metadata exists
+			for _, msg := range batch {
+				topic, exists := msg.MetaGet("kafka_server_topic")
+				assert.True(t, exists)
+				assert.Equal(t, testTopic, topic)
+			}
+
+			// Acknowledge
+			err = ackFn(ctx, nil)
+			require.NoError(t, err)
+		}
+	}
+
+	assert.Equal(t, numMessages, receivedCount)
+	t.Logf("Successfully received %d compressed messages", receivedCount)
+}
