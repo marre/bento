@@ -120,11 +120,11 @@ timeout: "5s"
 
 	// Send message asynchronously and wait for acknowledgment
 	produceChan := make(chan error, 1)
-	fmt.Println("TESTDEBUG: starting producer goroutine")
+	t.Logf("Starting producer goroutine")
 	go func() {
-		fmt.Println("TESTDEBUG: producer: before ProduceSync")
+		t.Logf("Producer: before ProduceSync")
 		results := client.ProduceSync(ctx, record)
-		fmt.Printf("TESTDEBUG: producer: after ProduceSync, results len=%d err=%v\n", len(results), results[0].Err)
+		t.Logf("Producer: after ProduceSync, results len=%d err=%v", len(results), results[0].Err)
 		if len(results) > 0 {
 			produceChan <- results[0].Err
 		} else {
@@ -155,10 +155,10 @@ timeout: "5s"
 
 	partitionAny, exists := msg.MetaGetMut("kafka_server_partition")
 	assert.True(t, exists)
-	fmt.Printf("TEST: Got partition: value=%v, type=%T\n", partitionAny, partitionAny)
-	partition, ok := partitionAny.(int32)
-	assert.True(t, ok, "partition should be int32")
-	assert.Equal(t, int32(0), partition)
+	t.Logf("Got partition: value=%v, type=%T", partitionAny, partitionAny)
+	partition, ok := partitionAny.(int)
+	assert.True(t, ok, "partition should be int")
+	assert.Equal(t, 0, partition)
 
 	// Verify header
 	header1, exists := msg.MetaGet("header1")
@@ -597,9 +597,9 @@ func TestApiVersionsResponseStructure(t *testing.T) {
 	buf := kbin.AppendInt32(nil, 0) // correlationID = 0
 	buf = resp.AppendTo(buf)
 
-	fmt.Printf("TEST: ApiVersions response hex (total %d bytes): %x\n", len(buf), buf)
-	fmt.Printf("TEST: Response body (after correlationID, %d bytes): %x\n", len(buf)-4, buf[4:])
-	fmt.Printf("TEST: Is flexible: %v\n", resp.IsFlexible())
+	t.Logf("ApiVersions response hex (total %d bytes): %x", len(buf), buf)
+	t.Logf("Response body (after correlationID, %d bytes): %x", len(buf)-4, buf[4:])
+	t.Logf("Is flexible: %v", resp.IsFlexible())
 }
 
 func TestMetadataResponseRoundTrip(t *testing.T) {
@@ -625,8 +625,8 @@ func TestMetadataResponseRoundTrip(t *testing.T) {
 	buf = resp.AppendTo(buf)
 
 	// Debug: print the hex
-	fmt.Printf("TEST: Metadata response hex (total %d bytes): %x\n", len(buf), buf)
-	fmt.Printf("TEST: Response body (after correlationID, %d bytes): %x\n", len(buf)-4, buf[4:])
+	t.Logf("Metadata response hex (total %d bytes): %x", len(buf), buf)
+	t.Logf("Response body (after correlationID, %d bytes): %x", len(buf)-4, buf[4:])
 
 	// Now parse back after skipping correlation id
 	parsed := kmsg.NewMetadataResponse()
@@ -654,7 +654,7 @@ func TestKafkaServerInputCompression(t *testing.T) {
 	env := service.NewEnvironment()
 
 	config := `
-address: "127.0.0.1:19097"
+address: "127.0.0.1:19099"
 `
 
 	parsed, err := spec.ParseYAML(config, env)
@@ -671,7 +671,7 @@ address: "127.0.0.1:19097"
 
 	// Create producer with Snappy compression (default when batching)
 	client, err := kgo.NewClient(
-		kgo.SeedBrokers("127.0.0.1:19097"),
+		kgo.SeedBrokers("127.0.0.1:19099"),
 		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
 	)
 	require.NoError(t, err)

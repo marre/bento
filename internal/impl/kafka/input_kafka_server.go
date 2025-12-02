@@ -16,12 +16,12 @@ import (
 
 	"github.com/Jeffail/shutdown"
 	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/warpstreamlabs/bento/public/service"
-	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -41,6 +41,9 @@ const (
 	codecSnappy int8 = 2
 	codecLZ4    int8 = 3
 	codecZstd   int8 = 4
+
+	// compressionCodecMask extracts the compression codec from the lower 3 bits of the Attributes field
+	compressionCodecMask = 0x07
 )
 
 func min(a, b int) int {
@@ -142,7 +145,7 @@ type kafkaServerInput struct {
 
 	shutSig *shutdown.Signaller
 	connWG  sync.WaitGroup
-	parseMu sync.Mutex // Serialize kmsg parsing to avoid race conditions
+	parseMu sync.Mutex // Protects kmsg ReadFrom calls to prevent concurrent map access in franz-go internals
 }
 
 type messageBatch struct {
@@ -358,7 +361,11 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	// The reader b is already positioned after the 8-byte header (apiKey + apiVersion + correlationID)
 
 	// Read clientID (nullable string: int16 length, then data)
+	const maxClientIDLength = 10000 // Reasonable limit to prevent DoS
 	clientIDLen := b.Int16()
+	if clientIDLen < 0 || clientIDLen > maxClientIDLength {
+		return fmt.Errorf("invalid client ID length: %d (max: %d)", clientIDLen, maxClientIDLength)
+	}
 	if clientIDLen > 0 {
 		b.Span(int(clientIDLen))
 	}
@@ -397,7 +404,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		k.parseMu.Unlock()
 
 		if parseErr != nil {
-			k.logger.Debugf("ReadFrom FAILED for Metadata: %v", parseErr)
 			k.logger.Errorf("Failed to parse MetadataRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, kerr.UnknownServerError.Code)
 		} else {
@@ -417,7 +423,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		k.parseMu.Unlock()
 
 		if parseErr != nil {
-			k.logger.Debugf("ReadFrom failed: %v", parseErr)
 			k.logger.Errorf("Failed to parse ProduceRequest: %v", parseErr)
 			err = k.sendErrorResponse(conn, correlationID, kerr.UnknownServerError.Code)
 		} else {
@@ -579,8 +584,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 			k.logger.Debugf("About to parse record batch for partition %d", i)
 			messages, err := k.parseRecordBatch(partition.Records, topicName, partition.Partition, remoteAddr)
 			if err != nil {
-				k.logger.Debugf("Failed to parse record batch: %v", err)
-				k.logger.Errorf("Failed to parse record batch: %v", err)
+				k.logger.Errorf("Failed to parse record batch for topic=%s partition=%d: %v", topicName, partition.Partition, err)
 				continue
 			}
 			k.logger.Debugf("Parsed %d messages from partition %d", len(messages), i)
@@ -725,7 +729,7 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 	k.logger.Debugf("RecordBatch has %d records, Attributes=0x%x, Records len=%d", recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
 
 	// Check for compression (lower 3 bits of Attributes)
-	compression := int8(recordBatch.Attributes & 0x07)
+	compression := int8(recordBatch.Attributes & compressionCodecMask)
 
 	// Decompress records if needed
 	recordsData := recordBatch.Records
@@ -790,7 +794,6 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		k.parseMu.Unlock()
 
 		if recordErr != nil {
-			k.logger.Debugf("Failed to parse record %d: %v", i, recordErr)
 			k.logger.Warnf("Failed to parse record %d: %v", i, recordErr)
 			offset += recordLen // Skip this bad record
 			continue
@@ -800,19 +803,21 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 
 		// Calculate absolute timestamp
 		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
+		timestampTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
 
 		// Create Bento message
 		msg := service.NewMessage(record.Value)
 		msg.MetaSetMut("kafka_server_topic", topic)
-		msg.MetaSetMut("kafka_server_partition", partition)
-		k.logger.Debugf("Set partition metadata: value=%v, type=%T", partition, partition)
+		msg.MetaSetMut("kafka_server_partition", int(partition)) // Convert to int for consistency with franz input
 		msg.MetaSetMut("kafka_server_offset", recordBatch.FirstOffset+int64(record.OffsetDelta))
+		msg.MetaSetMut("kafka_server_tombstone_message", record.Value == nil)
 
 		if record.Key != nil {
 			msg.MetaSetMut("kafka_server_key", string(record.Key))
 		}
 
-		msg.MetaSetMut("kafka_server_timestamp", time.Unix(timestamp/1000, (timestamp%1000)*1000000).Format(time.RFC3339))
+		msg.MetaSetMut("kafka_server_timestamp_unix", timestampTime.Unix())
+		msg.MetaSetMut("kafka_server_timestamp", timestampTime.Format(time.RFC3339))
 		msg.MetaSetMut("kafka_server_remote_addr", remoteAddr)
 
 		// Add record headers as metadata
