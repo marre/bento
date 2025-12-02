@@ -304,8 +304,11 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 			return
 		}
 
-		if size <= 0 || size > int32(k.maxMessageBytes)*10 {
-			k.logger.Errorf("Invalid request size: %d", size)
+		// Request size should not exceed maxMessageBytes * 2 (to account for protocol overhead)
+		// Plus a reasonable upper bound for headers and metadata (100KB)
+		maxRequestSize := int32(k.maxMessageBytes)*2 + 102400
+		if size <= 0 || size > maxRequestSize {
+			k.logger.Errorf("Invalid request size: %d (max: %d)", size, maxRequestSize)
 			return
 		}
 
@@ -608,12 +611,19 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 		k.logger.Debugf("Successfully sent batch to pipeline")
 	case <-time.After(k.timeout):
 		k.logger.Debugf("Timeout sending batch to pipeline")
-		resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
-			Topic: req.Topics[0].Topic,
-			Partitions: []kmsg.ProduceResponseTopicPartition{
-				{Partition: 0, ErrorCode: kerr.RequestTimedOut.Code},
-			},
-		})
+		// Build timeout error response for all topics/partitions
+		for _, topic := range req.Topics {
+			respTopic := kmsg.ProduceResponseTopic{
+				Topic: topic.Topic,
+			}
+			for _, partition := range topic.Partitions {
+				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+					Partition: partition.Partition,
+					ErrorCode: kerr.RequestTimedOut.Code,
+				})
+			}
+			resp.Topics = append(resp.Topics, respTopic)
+		}
 		return k.sendResponse(conn, correlationID, resp)
 	case <-k.shutdownCh:
 		return fmt.Errorf("shutting down")
@@ -646,12 +656,19 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, correlationID int32, 
 				resp.Topics = append(resp.Topics, respTopic)
 			}
 		case <-time.After(k.timeout):
-			resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
-				Topic: req.Topics[0].Topic,
-				Partitions: []kmsg.ProduceResponseTopicPartition{
-					{Partition: 0, ErrorCode: kerr.RequestTimedOut.Code},
-				},
-			})
+			// Build timeout error response for all topics/partitions
+			for _, topic := range req.Topics {
+				respTopic := kmsg.ProduceResponseTopic{
+					Topic: topic.Topic,
+				}
+				for _, partition := range topic.Partitions {
+					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+						Partition: partition.Partition,
+						ErrorCode: kerr.RequestTimedOut.Code,
+					})
+				}
+				resp.Topics = append(resp.Topics, respTopic)
+			}
 		case <-k.shutdownCh:
 			return fmt.Errorf("shutting down")
 		}
@@ -696,7 +713,12 @@ func decompressRecords(data []byte, codec int8) ([]byte, error) {
 func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
 	// Use kmsg.RecordBatch to parse the batch header
 	recordBatch := kmsg.RecordBatch{}
-	if err := recordBatch.ReadFrom(data); err != nil {
+
+	k.parseMu.Lock()
+	err := recordBatch.ReadFrom(data)
+	k.parseMu.Unlock()
+
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse record batch: %w", err)
 	}
 
@@ -762,9 +784,14 @@ func (k *kafkaServerInput) parseRecordBatch(data []byte, topic string, partition
 		// Parse the record
 		record := kmsg.NewRecord()
 		k.logger.Debugf("Parsing record %d from %d bytes, hex: %x", i, len(recordData), recordData[:min(10, len(recordData))])
-		if err := record.ReadFrom(recordData); err != nil {
-			k.logger.Debugf("Failed to parse record %d: %v", i, err)
-			k.logger.Warnf("Failed to parse record %d: %v", i, err)
+
+		k.parseMu.Lock()
+		recordErr := record.ReadFrom(recordData)
+		k.parseMu.Unlock()
+
+		if recordErr != nil {
+			k.logger.Debugf("Failed to parse record %d: %v", i, recordErr)
+			k.logger.Warnf("Failed to parse record %d: %v", i, recordErr)
 			offset += recordLen // Skip this bad record
 			continue
 		}
