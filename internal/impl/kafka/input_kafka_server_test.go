@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
 
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -732,4 +733,217 @@ address: "127.0.0.1:19099"
 
 	assert.Equal(t, numMessages, receivedCount)
 	t.Logf("Successfully received %d compressed messages", receivedCount)
+}
+
+func TestKafkaServerInputSASLPlain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SASL PLAIN authentication
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19100"
+sasl:
+  - mechanism: PLAIN
+    username: "testuser"
+    password: "testpass"
+  - mechanism: PLAIN
+    username: "anotheruser"
+    password: "anotherpass"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	t.Logf("Creating client with SASL PLAIN authentication")
+
+	// Create client with SASL PLAIN authentication
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19100"),
+		kgo.SASL(plain.Plain(func(context.Context) (plain.Auth, error) {
+			t.Logf("SASL PLAIN auth callback called")
+			return plain.Auth{
+				User: "testuser",
+				Pass: "testpass",
+			}, nil
+		})),
+		kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+			return "[CLIENT] "
+		})),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	t.Logf("Client created successfully")
+
+	// Produce a test message
+	testTopic := "authenticated-topic"
+	testValue := "authenticated-message"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	produceChan := make(chan error, 1)
+	go func() {
+		t.Logf("Producer goroutine: calling ProduceSync")
+		results := client.ProduceSync(ctx, record)
+		t.Logf("Producer goroutine: ProduceSync returned, results len=%d", len(results))
+		if len(results) > 0 {
+			produceChan <- results[0].Err
+		}
+	}()
+
+	t.Logf("Calling ReadBatch")
+	// Read message from input
+	batch, ackFn, err := input.ReadBatch(ctx)
+	t.Logf("ReadBatch returned: batch len=%d, err=%v", len(batch), err)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msg := batch[0]
+
+	// Verify message content
+	msgBytes, err := msg.AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, testValue, string(msgBytes))
+
+	// Verify metadata
+	topic, exists := msg.MetaGet("kafka_server_topic")
+	assert.True(t, exists)
+	assert.Equal(t, testTopic, topic)
+
+	// Acknowledge the message
+	err = ackFn(ctx, nil)
+	require.NoError(t, err)
+
+	// Verify producer received acknowledgment
+	select {
+	case err := <-produceChan:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for produce acknowledgment")
+	}
+}
+
+func TestKafkaServerInputSASLFailedAuth(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SASL PLAIN authentication
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19101"
+sasl:
+  - mechanism: PLAIN
+    username: "validuser"
+    password: "validpass"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create client with WRONG credentials
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19101"),
+		kgo.SASL(plain.Plain(func(context.Context) (plain.Auth, error) {
+			return plain.Auth{
+				User: "validuser",
+				Pass: "wrongpass",
+			}, nil
+		})),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Try to produce a message - should fail
+	testTopic := "test-topic"
+	testValue := "test-value"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	results := client.ProduceSync(ctx, record)
+	require.Len(t, results, 1)
+
+	// Should get an authentication error
+	assert.Error(t, results[0].Err)
+	t.Logf("Expected authentication error received: %v", results[0].Err)
+}
+
+func TestKafkaServerInputSASLWithoutAuth(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SASL enabled
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19102"
+sasl:
+  - mechanism: PLAIN
+    username: "testuser"
+    password: "testpass"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create client WITHOUT SASL authentication
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19102"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Try to produce a message - should fail
+	testTopic := "test-topic"
+	testValue := "test-value"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	results := client.ProduceSync(ctx, record)
+	require.Len(t, results, 1)
+
+	// Should get an error due to missing authentication
+	assert.Error(t, results[0].Err)
+	t.Logf("Expected authentication error received: %v", results[0].Err)
 }

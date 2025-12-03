@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -114,6 +115,22 @@ input:
       enabled: true
       cert_file: /path/to/cert.pem
       key_file: /path/to/key.pem
+`).
+		Example("With SASL Authentication", "Accept authenticated Kafka produce requests", `
+input:
+  kafka_server:
+    address: "0.0.0.0:9092"
+    tls:
+      enabled: true
+      cert_file: /path/to/cert.pem
+      key_file: /path/to/key.pem
+    sasl:
+      - mechanism: PLAIN
+        username: producer1
+        password: secret123
+      - mechanism: PLAIN
+        username: producer2
+        password: secret456
 `)
 }
 
@@ -134,7 +151,8 @@ type kafkaServerInput struct {
 	address         string
 	allowedTopics   map[string]struct{}
 	tlsConfig       *tls.Config
-	saslMechanisms  []string
+	saslEnabled     bool
+	saslUsers       map[string]string // username -> password
 	timeout         time.Duration
 	maxMessageBytes int
 
@@ -185,10 +203,47 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 		k.tlsConfig = tlsConf
 	}
 
-	// SASL support - we'll store mechanism names for validation
-	// Full SASL authentication would require more complex handling
+	// Parse SASL configuration
 	if conf.Contains(ksfFieldSASL) {
-		k.logger.Warn("SASL authentication is configured but not fully implemented in this version")
+		saslList, err := conf.FieldObjectList(ksfFieldSASL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse SASL config: %w", err)
+		}
+
+		k.saslUsers = make(map[string]string)
+		for i, saslConf := range saslList {
+			mechanism, err := saslConf.FieldString("mechanism")
+			if err != nil {
+				return nil, fmt.Errorf("SASL config %d: %w", i, err)
+			}
+
+			// Only support PLAIN for now
+			if mechanism != "PLAIN" {
+				return nil, fmt.Errorf("SASL config %d: unsupported mechanism %q (only PLAIN is supported)", i, mechanism)
+			}
+
+			username, err := saslConf.FieldString("username")
+			if err != nil {
+				return nil, fmt.Errorf("SASL config %d: %w", i, err)
+			}
+
+			password, err := saslConf.FieldString("password")
+			if err != nil {
+				return nil, fmt.Errorf("SASL config %d: %w", i, err)
+			}
+
+			if username == "" {
+				return nil, fmt.Errorf("SASL config %d: username cannot be empty", i)
+			}
+
+			k.saslUsers[username] = password
+			k.logger.Infof("Registered SASL PLAIN user: %s", username)
+		}
+
+		k.saslEnabled = len(k.saslUsers) > 0
+		if k.saslEnabled {
+			k.logger.Infof("SASL authentication enabled with %d user(s)", len(k.saslUsers))
+		}
 	}
 
 	if k.timeout, err = conf.FieldDuration(ksfFieldTimeout); err != nil {
@@ -283,6 +338,10 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 
 	k.logger.Debugf("Accepted connection from %s", conn.RemoteAddr())
 
+	// Track authentication state for this connection
+	// If SASL is disabled, consider the connection authenticated
+	authenticated := !k.saslEnabled
+
 	for {
 		select {
 		case <-k.shutdownCh:
@@ -322,19 +381,25 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// Parse and handle request
-		if err := k.handleRequest(conn, requestData); err != nil {
+		// Parse and handle request (may update authenticated state)
+		authUpdated, err := k.handleRequest(conn, requestData, &authenticated)
+		if err != nil {
 			k.logger.Errorf("Failed to handle request: %v", err)
 			return
+		}
+
+		// If authentication was just completed, log it
+		if authUpdated && authenticated {
+			k.logger.Infof("Client %s authenticated successfully", conn.RemoteAddr())
 		}
 	}
 }
 
-func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
+func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte, authenticated *bool) (bool, error) {
 	// Parse request header using kmsg types
 	if len(data) < 8 {
 		k.logger.Errorf("Request too small: %d bytes", len(data))
-		return fmt.Errorf("request too small: %d bytes", len(data))
+		return false, fmt.Errorf("request too small: %d bytes", len(data))
 	}
 
 	// Read header fields
@@ -343,7 +408,23 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	apiVersion := b.Int16()
 	correlationID := b.Int32()
 
+	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: apiKey=%d, apiVersion=%d, correlationID=%d, dataLen=%d\n", apiKey, apiVersion, correlationID, len(data))
+	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: full data (first 40 bytes): %x\n", data[:min(40, len(data))])
+	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: after header, b.Src len=%d, first 30 bytes: %x\n", len(b.Src), b.Src[:min(30, len(b.Src))])
+
 	k.logger.Debugf("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
+
+	// Check if client needs authentication first
+	if !*authenticated {
+		// Only allow ApiVersions, SASLHandshake, and SASLAuthenticate before authentication
+		switch kmsg.Key(apiKey) {
+		case kmsg.ApiVersions, kmsg.SASLHandshake, kmsg.SASLAuthenticate:
+			// These are allowed before authentication
+		default:
+			k.logger.Warnf("Rejecting unauthenticated request for API key %d from %s", apiKey, conn.RemoteAddr())
+			return false, fmt.Errorf("authentication required")
+		}
+	}
 
 	// Determine if flexible request (v3+ for ApiVersions, v9+ for others)
 	isFlexible := false
@@ -354,22 +435,44 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		isFlexible = apiVersion >= 9
 	case kmsg.Produce:
 		isFlexible = apiVersion >= 9
+	case kmsg.SASLHandshake:
+		isFlexible = false // SASL Handshake is never flexible
+	case kmsg.SASLAuthenticate:
+		// SASLAuthenticate v2+ has flexible request body but uses non-flexible header (v1)
+		isFlexible = false
 	}
 
-	// For both flexible and non-flexible requests, clientID is a NULLABLE_STRING (int16 length, then data)
-	// For flexible requests (Header v2), there's also a TAG_BUFFER after clientID
-	// The reader b is already positioned after the 8-byte header (apiKey + apiVersion + correlationID)
-
-	// Read clientID (nullable string: int16 length, then data)
+	// Parse clientID from request header
+	// The encoding depends on whether the request is flexible or not
+	// For flexible requests (v2+), clientID is COMPACT_STRING (uvarint length)
+	// For non-flexible requests, clientID is NULLABLE_STRING (int16 length)
 	const maxClientIDLength = 10000 // Reasonable limit to prevent DoS
-	clientIDLen := b.Int16()
-	if clientIDLen < 0 || clientIDLen > maxClientIDLength {
-		return fmt.Errorf("invalid client ID length: %d (max: %d)", clientIDLen, maxClientIDLength)
-	}
-	if clientIDLen > 0 {
-		b.Span(int(clientIDLen))
+
+	if isFlexible {
+		// Flexible: COMPACT_STRING (uvarint length)
+		clientIDLen := b.Uvarint()
+		fmt.Fprintf(os.Stderr, "[SERVER] Flexible clientID: raw uvarint=%d\n", clientIDLen)
+		if clientIDLen > 0 {
+			// Length is (actual_length + 1), so subtract 1
+			actualLen := clientIDLen - 1
+			if actualLen > maxClientIDLength {
+				return false, fmt.Errorf("invalid client ID length: %d (max: %d)", actualLen, maxClientIDLength)
+			}
+			fmt.Fprintf(os.Stderr, "[SERVER] Consuming %d bytes for clientID\n", actualLen)
+			b.Span(int(actualLen))
+		}
+	} else {
+		// Non-flexible: NULLABLE_STRING (int16 length)
+		clientIDLen := b.Int16()
+		if clientIDLen < 0 || clientIDLen > maxClientIDLength {
+			return false, fmt.Errorf("invalid client ID length: %d (max: %d)", clientIDLen, maxClientIDLength)
+		}
+		if clientIDLen > 0 {
+			b.Span(int(clientIDLen))
+		}
 	}
 
+	// For flexible requests, parse TAG_BUFFER (even for SASLAuthenticate which skips clientID)
 	if isFlexible {
 		// Flexible header v2 has TAG_BUFFER (compact array of tagged fields)
 		tagCount := b.Uvarint()
@@ -387,6 +490,8 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 	k.logger.Debugf("Request body from offset %d (isFlexible=%v): %x", offset, isFlexible, data[offset:min(offset+20, len(data))])
 
 	var err error
+	authUpdated := false
+
 	switch kmsg.Key(apiKey) {
 	case kmsg.ApiVersions:
 		// ApiVersions request has minimal/no body
@@ -394,6 +499,19 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		resp := kmsg.NewApiVersionsResponse()
 		resp.SetVersion(apiVersion)
 		err = k.handleApiVersionsReq(conn, correlationID, nil, &resp)
+	case kmsg.SASLHandshake:
+		// Handle SASL handshake
+		k.logger.Debugf("Handling SASLHandshake")
+		err = k.handleSaslHandshake(conn, correlationID, data[offset:], apiVersion)
+	case kmsg.SASLAuthenticate:
+		// Handle SASL authentication
+		k.logger.Debugf("Handling SASLAuthenticate")
+		authSuccess := false
+		authSuccess, err = k.handleSaslAuthenticate(conn, correlationID, data[offset:], apiVersion)
+		if err == nil && authSuccess {
+			*authenticated = true
+			authUpdated = true
+		}
 	case kmsg.Metadata:
 		// Parse metadata request body (after header)
 		req := kmsg.NewMetadataRequest()
@@ -435,7 +553,126 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte) error {
 		err = k.sendErrorResponse(conn, correlationID, kerr.UnsupportedVersion.Code)
 	}
 
+	return authUpdated, err
+}
+
+func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, correlationID int32, data []byte, apiVersion int16) error {
+	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslHandshake called: correlationID=%d, apiVersion=%d, dataLen=%d\n", correlationID, apiVersion, len(data))
+
+	req := kmsg.NewSASLHandshakeRequest()
+	req.SetVersion(apiVersion)
+
+	k.parseMu.Lock()
+	err := req.ReadFrom(data)
+	k.parseMu.Unlock()
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[SERVER] Failed to parse SASLHandshakeRequest: %v\n", err)
+		return k.sendErrorResponse(conn, correlationID, kerr.IllegalSaslState.Code)
+	}
+
+	fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake request for mechanism: '%s' (len=%d, bytes=%x)\n", req.Mechanism, len(req.Mechanism), []byte(req.Mechanism))
+
+	resp := kmsg.NewSASLHandshakeResponse()
+	resp.SetVersion(apiVersion)
+
+	// Check if requested mechanism is PLAIN (the only one we support)
+	fmt.Fprintf(os.Stderr, "[SERVER] Comparing mechanism: req.Mechanism='%s' vs 'PLAIN', equal=%v\n", req.Mechanism, req.Mechanism == "PLAIN")
+	if req.Mechanism == "PLAIN" {
+		resp.ErrorCode = 0
+		resp.SupportedMechanisms = []string{"PLAIN"}
+		fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake accepted for PLAIN, ErrorCode=%d\n", resp.ErrorCode)
+	} else {
+		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
+		resp.SupportedMechanisms = []string{"PLAIN"}
+		fmt.Fprintf(os.Stderr, "[SERVER] Unsupported SASL mechanism requested: '%s', ErrorCode=%d\n", req.Mechanism, resp.ErrorCode)
+	}
+
+	err = k.sendResponse(conn, correlationID, &resp)
+	fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake response sent, err=%v\n", err)
 	return err
+}
+
+func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, correlationID int32, data []byte, apiVersion int16) (bool, error) {
+	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslAuthenticate called: correlationID=%d, apiVersion=%d, dataLen=%d\n", correlationID, apiVersion, len(data))
+	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslAuthenticate data (first 30 bytes): %x\n", data[:min(30, len(data))])
+
+	// Manually parse SASL auth bytes
+	// Format for v2: INT16 length + auth_bytes + TAG_BUFFER (for flexible)
+	if len(data) < 2 {
+		k.sendErrorResponse(conn, correlationID, kerr.SaslAuthenticationFailed.Code)
+		return false, fmt.Errorf("SASL authenticate data too short")
+	}
+
+	b := kbin.Reader{Src: data}
+	authLen := b.Int16()
+	if authLen < 0 || int(authLen) > len(b.Src) {
+		k.sendErrorResponse(conn, correlationID, kerr.SaslAuthenticationFailed.Code)
+		return false, fmt.Errorf("invalid SASL auth bytes length: %d", authLen)
+	}
+
+	authBytes := b.Span(int(authLen))
+	fmt.Fprintf(os.Stderr, "[SERVER] SASL authenticate request received, auth bytes length: %d\n", len(authBytes))
+
+	resp := kmsg.NewSASLAuthenticateResponse()
+	resp.SetVersion(apiVersion)
+
+	// Validate PLAIN credentials
+	authenticated := k.validatePlain(authBytes)
+
+	if authenticated {
+		resp.ErrorCode = 0
+		fmt.Fprintf(os.Stderr, "[SERVER] SASL authentication succeeded for %s, sending success response\n", conn.RemoteAddr())
+	} else {
+		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
+		errMsg := "Authentication failed"
+		resp.ErrorMessage = &errMsg
+		fmt.Fprintf(os.Stderr, "[SERVER] SASL authentication failed for %s, sending failure response\n", conn.RemoteAddr())
+	}
+
+	err := k.sendResponse(conn, correlationID, &resp)
+	fmt.Fprintf(os.Stderr, "[SERVER] SASL authenticate response sent, authenticated=%v, err=%v\n", authenticated, err)
+	return authenticated, err
+}
+
+// validatePlain validates PLAIN SASL credentials
+// PLAIN format: [authzid] \0 username \0 password
+func (k *kafkaServerInput) validatePlain(authBytes []byte) bool {
+	fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: authBytes (hex): %x\n", authBytes)
+
+	// Split by null bytes
+	parts := bytes.Split(authBytes, []byte{0})
+	fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: split into %d parts\n", len(parts))
+	for i, part := range parts {
+		fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: parts[%d] = %q (len=%d)\n", i, string(part), len(part))
+	}
+
+	if len(parts) < 3 {
+		k.logger.Debugf("Invalid PLAIN auth format: expected at least 3 parts, got %d", len(parts))
+		return false
+	}
+
+	// parts[0] is authzid (authorization identity), usually empty
+	// parts[1] is username (authentication identity)
+	// parts[2] is password
+	username := string(parts[1])
+	password := string(parts[2])
+
+	k.logger.Debugf("Validating credentials for username: %s", username)
+
+	expectedPassword, exists := k.saslUsers[username]
+	if !exists {
+		k.logger.Debugf("User not found: %s", username)
+		return false
+	}
+
+	if expectedPassword != password {
+		k.logger.Debugf("Password mismatch for user: %s", username)
+		return false
+	}
+
+	k.logger.Debugf("Credentials validated successfully for user: %s", username)
+	return true
 }
 
 func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int32, req *kmsg.ApiVersionsRequest, resp *kmsg.ApiVersionsResponse) error {
@@ -451,7 +688,15 @@ func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, correlationID int
 		{ApiKey: int16(kmsg.Produce), MinVersion: 0, MaxVersion: 9},     // Produce (support up to v9)
 	}
 
-	k.logger.Debugf("About to send ApiVersions response")
+	// Advertise SASL support if enabled
+	if k.saslEnabled {
+		resp.ApiKeys = append(resp.ApiKeys,
+			kmsg.ApiVersionsResponseApiKey{ApiKey: int16(kmsg.SASLHandshake), MinVersion: 0, MaxVersion: 1},
+			kmsg.ApiVersionsResponseApiKey{ApiKey: int16(kmsg.SASLAuthenticate), MinVersion: 0, MaxVersion: 2},
+		)
+	}
+
+	k.logger.Debugf("About to send ApiVersions response (SASL enabled: %v)", k.saslEnabled)
 	return k.sendResponse(conn, correlationID, resp)
 }
 
