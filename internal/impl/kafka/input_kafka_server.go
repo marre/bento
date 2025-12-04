@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -408,14 +407,10 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte, authenticat
 	apiVersion := b.Int16()
 	correlationID := b.Int32()
 
-	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: apiKey=%d, apiVersion=%d, correlationID=%d, dataLen=%d\n", apiKey, apiVersion, correlationID, len(data))
-	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: full data (first 40 bytes): %x\n", data[:min(40, len(data))])
-	fmt.Fprintf(os.Stderr, "[SERVER] handleRequest: after header, b.Src len=%d, first 30 bytes: %x\n", len(b.Src), b.Src[:min(30, len(b.Src))])
-
 	k.logger.Debugf("Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", apiKey, apiVersion, correlationID, len(data))
 
-	// Check if client needs authentication first
-	if !*authenticated {
+	// Check if client needs authentication first (only if SASL is enabled)
+	if k.saslEnabled && !*authenticated {
 		// Only allow ApiVersions, SASLHandshake, and SASLAuthenticate before authentication
 		switch kmsg.Key(apiKey) {
 		case kmsg.ApiVersions, kmsg.SASLHandshake, kmsg.SASLAuthenticate:
@@ -448,31 +443,12 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte, authenticat
 	// For non-flexible requests, clientID is NULLABLE_STRING (int16 length)
 	const maxClientIDLength = 10000 // Reasonable limit to prevent DoS
 
-	if isFlexible {
-		// Flexible: COMPACT_STRING (uvarint length)
-		clientIDLen := b.Uvarint()
-		fmt.Fprintf(os.Stderr, "[SERVER] Flexible clientID: raw uvarint=%d\n", clientIDLen)
-		if clientIDLen > 0 {
-			// Length is (actual_length + 1), so subtract 1
-			actualLen := clientIDLen - 1
-			if actualLen > maxClientIDLength {
-				return false, fmt.Errorf("invalid client ID length: %d (max: %d)", actualLen, maxClientIDLength)
-			}
-			fmt.Fprintf(os.Stderr, "[SERVER] Consuming %d bytes for clientID\n", actualLen)
-			b.Span(int(actualLen))
-		}
-	} else {
-		// Non-flexible: NULLABLE_STRING (int16 length)
-		clientIDLen := b.Int16()
-		if clientIDLen < 0 || clientIDLen > maxClientIDLength {
-			return false, fmt.Errorf("invalid client ID length: %d (max: %d)", clientIDLen, maxClientIDLength)
-		}
-		if clientIDLen > 0 {
-			b.Span(int(clientIDLen))
-		}
+	// Read clientID (nullable string: int16 length, then data)
+	clientIDLen := b.Int16()
+	if clientIDLen > 0 {
+		b.Span(int(clientIDLen))
 	}
 
-	// For flexible requests, parse TAG_BUFFER (even for SASLAuthenticate which skips clientID)
 	if isFlexible {
 		// Flexible header v2 has TAG_BUFFER (compact array of tagged fields)
 		tagCount := b.Uvarint()
@@ -557,8 +533,6 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, data []byte, authenticat
 }
 
 func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, correlationID int32, data []byte, apiVersion int16) error {
-	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslHandshake called: correlationID=%d, apiVersion=%d, dataLen=%d\n", correlationID, apiVersion, len(data))
-
 	req := kmsg.NewSASLHandshakeRequest()
 	req.SetVersion(apiVersion)
 
@@ -567,36 +541,25 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, correlationID int3
 	k.parseMu.Unlock()
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[SERVER] Failed to parse SASLHandshakeRequest: %v\n", err)
 		return k.sendErrorResponse(conn, correlationID, kerr.IllegalSaslState.Code)
 	}
-
-	fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake request for mechanism: '%s' (len=%d, bytes=%x)\n", req.Mechanism, len(req.Mechanism), []byte(req.Mechanism))
 
 	resp := kmsg.NewSASLHandshakeResponse()
 	resp.SetVersion(apiVersion)
 
 	// Check if requested mechanism is PLAIN (the only one we support)
-	fmt.Fprintf(os.Stderr, "[SERVER] Comparing mechanism: req.Mechanism='%s' vs 'PLAIN', equal=%v\n", req.Mechanism, req.Mechanism == "PLAIN")
 	if req.Mechanism == "PLAIN" {
 		resp.ErrorCode = 0
 		resp.SupportedMechanisms = []string{"PLAIN"}
-		fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake accepted for PLAIN, ErrorCode=%d\n", resp.ErrorCode)
 	} else {
 		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
 		resp.SupportedMechanisms = []string{"PLAIN"}
-		fmt.Fprintf(os.Stderr, "[SERVER] Unsupported SASL mechanism requested: '%s', ErrorCode=%d\n", req.Mechanism, resp.ErrorCode)
 	}
 
-	err = k.sendResponse(conn, correlationID, &resp)
-	fmt.Fprintf(os.Stderr, "[SERVER] SASL handshake response sent, err=%v\n", err)
-	return err
+	return k.sendResponse(conn, correlationID, &resp)
 }
 
 func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, correlationID int32, data []byte, apiVersion int16) (bool, error) {
-	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslAuthenticate called: correlationID=%d, apiVersion=%d, dataLen=%d\n", correlationID, apiVersion, len(data))
-	fmt.Fprintf(os.Stderr, "[SERVER] handleSaslAuthenticate data (first 30 bytes): %x\n", data[:min(30, len(data))])
-
 	// Manually parse SASL auth bytes
 	// Format for v2: INT16 length + auth_bytes + TAG_BUFFER (for flexible)
 	if len(data) < 2 {
@@ -612,7 +575,6 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, correlationID i
 	}
 
 	authBytes := b.Span(int(authLen))
-	fmt.Fprintf(os.Stderr, "[SERVER] SASL authenticate request received, auth bytes length: %d\n", len(authBytes))
 
 	resp := kmsg.NewSASLAuthenticateResponse()
 	resp.SetVersion(apiVersion)
@@ -622,30 +584,21 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, correlationID i
 
 	if authenticated {
 		resp.ErrorCode = 0
-		fmt.Fprintf(os.Stderr, "[SERVER] SASL authentication succeeded for %s, sending success response\n", conn.RemoteAddr())
 	} else {
 		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
 		errMsg := "Authentication failed"
 		resp.ErrorMessage = &errMsg
-		fmt.Fprintf(os.Stderr, "[SERVER] SASL authentication failed for %s, sending failure response\n", conn.RemoteAddr())
 	}
 
 	err := k.sendResponse(conn, correlationID, &resp)
-	fmt.Fprintf(os.Stderr, "[SERVER] SASL authenticate response sent, authenticated=%v, err=%v\n", authenticated, err)
 	return authenticated, err
 }
 
 // validatePlain validates PLAIN SASL credentials
 // PLAIN format: [authzid] \0 username \0 password
 func (k *kafkaServerInput) validatePlain(authBytes []byte) bool {
-	fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: authBytes (hex): %x\n", authBytes)
-
 	// Split by null bytes
 	parts := bytes.Split(authBytes, []byte{0})
-	fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: split into %d parts\n", len(parts))
-	for i, part := range parts {
-		fmt.Fprintf(os.Stderr, "[SERVER] validatePlain: parts[%d] = %q (len=%d)\n", i, string(part), len(part))
-	}
 
 	if len(parts) < 3 {
 		k.logger.Debugf("Invalid PLAIN auth format: expected at least 3 parts, got %d", len(parts))
