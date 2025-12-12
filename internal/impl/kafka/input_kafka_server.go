@@ -548,8 +548,8 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 
 		if parseErr != nil {
 			k.logger.Errorf("[conn:%d] Failed to parse MetadataRequest: %v", connID, parseErr)
-			// Send error response with appropriate error code
-			resp.ErrorCode = kmsg.NewPtr(kerr.InvalidRequest.Code)
+			// Send empty response - can't properly signal error without knowing requested topics
+			// The connection will likely be closed by the client after this invalid request
 			err = k.sendResponse(conn, connID, correlationID, &resp)
 		} else {
 			k.logger.Debugf("[conn:%d] ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d", connID, offset, len(req.Topics))
@@ -567,16 +567,8 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 
 		if parseErr != nil {
 			k.logger.Errorf("[conn:%d] Failed to parse ProduceRequest: %v", connID, parseErr)
-			// Send error response - for Produce we need to set ErrorCode at the top level if supported by version
-			// For older versions, we would need to add error to each topic/partition, but since we can't parse
-			// the request, we don't know which topics/partitions were requested. Just send empty response with
-			// top-level error if the version supports it, otherwise send minimal response.
-			if resp.Version >= 8 {
-				// Version 8+ supports top-level ErrorCode
-				resp.ErrorCode = kmsg.NewPtr(kerr.InvalidRequest.Code)
-			}
-			// Note: For versions < 8, we can't properly signal the error without knowing topics/partitions
-			// The connection will likely close anyway after this invalid request
+			// Send empty response - can't properly signal error without knowing which topics/partitions
+			// were requested. The connection will likely be closed by the client after this invalid request.
 			err = k.sendResponse(conn, connID, correlationID, &resp)
 		} else {
 			err = k.handleProduceReq(conn, connID, remoteAddr, correlationID, &req, &resp)
@@ -875,9 +867,25 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	}
 
 	k.logger.Debugf("[conn:%d] Total batch size: %d messages", connID, len(batch))
-	// If no messages, send success
+	// If no messages, still need to build response for all requested topics/partitions
 	if len(batch) == 0 {
-		k.logger.Debugf("[conn:%d] Sending empty response (no messages)", connID)
+		k.logger.Debugf("[conn:%d] No messages to process, building success response", connID)
+		// Build response for all topics/partitions that were in the request
+		for _, topic := range req.Topics {
+			respTopic := kmsg.ProduceResponseTopic{
+				Topic: topic.Topic,
+			}
+			for _, partition := range topic.Partitions {
+				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+					Partition:      partition.Partition,
+					ErrorCode:      0, // Success
+					BaseOffset:     0,
+					LogAppendTime:  -1,
+					LogStartOffset: 0,
+				})
+			}
+			resp.Topics = append(resp.Topics, respTopic)
+		}
 		return k.sendResponse(conn, connID, correlationID, resp)
 	}
 
@@ -962,6 +970,24 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		case <-k.shutdownCh:
 			return fmt.Errorf("shutting down")
 		}
+	} else {
+		// When acks=0, don't wait for acknowledgment but still build response
+		k.logger.Debugf("[conn:%d] acks=0, sending immediate success response", connID)
+		for _, topic := range req.Topics {
+			respTopic := kmsg.ProduceResponseTopic{
+				Topic: topic.Topic,
+			}
+			for _, partition := range topic.Partitions {
+				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+					Partition:      partition.Partition,
+					ErrorCode:      0, // Success
+					BaseOffset:     0,
+					LogAppendTime:  -1,
+					LogStartOffset: 0,
+				})
+			}
+			resp.Topics = append(resp.Topics, respTopic)
+		}
 	}
 
 	return k.sendResponse(conn, connID, correlationID, resp)
@@ -1039,37 +1065,29 @@ func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic st
 			break
 		}
 
-		// ALL records have a varint length prefix according to Kafka protocol
-		// This is true regardless of whether there's 1 or multiple records
-		recordLen32, lenBytesConsumed := kbin.Varint(recordsData[offset:])
-		if lenBytesConsumed == 0 {
-			k.logger.Warnf("[conn:%d] Failed to read varint length for record %d", connID, i)
-			break
-		}
-		recordLen := int(recordLen32)
-		k.logger.Debugf("[conn:%d] Record %d has length varint: %d bytes, recordLen=%d", connID, i, lenBytesConsumed, recordLen)
-		offset += lenBytesConsumed
-
-		if offset+recordLen > len(recordsData) {
-			k.logger.Warnf("[conn:%d] Record %d extends beyond available data: offset=%d, recordLen=%d, available=%d", connID, i, offset, recordLen, len(recordsData))
-			break
-		}
-
-		recordData := recordsData[offset : offset+recordLen]
-
-		// Parse the record
+		// Parse the record - ReadFrom expects data that INCLUDES the length varint
 		record := kmsg.NewRecord()
-		k.logger.Debugf("[conn:%d] Parsing record %d from %d bytes, hex: %x", connID, i, len(recordData), recordData[:min(10, len(recordData))])
+		k.logger.Debugf("[conn:%d] Parsing record %d from offset %d", connID, i, offset)
 
-		recordErr := record.ReadFrom(recordData)
+		recordErr := record.ReadFrom(recordsData[offset:])
 
 		if recordErr != nil {
 			k.logger.Warnf("[conn:%d] Failed to parse record %d: %v", connID, i, recordErr)
-			offset += recordLen // Skip this bad record
-			continue
+			// Can't reliably skip this record since we don't know its length
+			break
 		}
 
-		offset += recordLen
+		// Calculate how many bytes the record consumed: length varint + record data
+		// The record.Length field contains the length of data AFTER the varint
+		recordLen32, lenBytesConsumed := kbin.Varint(recordsData[offset:])
+		if lenBytesConsumed == 0 {
+			k.logger.Warnf("[conn:%d] Failed to read varint length for record %d after parsing", connID, i)
+			break
+		}
+		totalBytesConsumed := lenBytesConsumed + int(recordLen32)
+		k.logger.Debugf("[conn:%d] Record %d consumed %d bytes (varint: %d, data: %d)", connID, i, totalBytesConsumed, lenBytesConsumed, recordLen32)
+
+		offset += totalBytesConsumed
 
 		// Calculate absolute timestamp
 		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
