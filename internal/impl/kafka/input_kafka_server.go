@@ -4,12 +4,18 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -23,6 +29,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/warpstreamlabs/bento/public/service"
+	"github.com/xdg-go/scram"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
@@ -134,7 +142,7 @@ input:
       cert_file: /path/to/cert.pem
       key_file: /path/to/key.pem
 `).
-		Example("With SASL Authentication", "Accept authenticated Kafka produce requests", `
+		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
   kafka_server:
     address: "0.0.0.0:9092"
@@ -147,6 +155,22 @@ input:
         username: producer1
         password: secret123
       - mechanism: PLAIN
+        username: producer2
+        password: secret456
+`).
+		Example("With SASL SCRAM Authentication", "Accept authenticated Kafka produce requests using SCRAM-SHA-256", `
+input:
+  kafka_server:
+    address: "0.0.0.0:9092"
+    tls:
+      enabled: true
+      cert_file: /path/to/cert.pem
+      key_file: /path/to/key.pem
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: producer1
+        password: secret123
+      - mechanism: SCRAM-SHA-512
         username: producer2
         password: secret456
 `)
@@ -170,7 +194,10 @@ type kafkaServerInput struct {
 	allowedTopics   map[string]struct{}
 	tlsConfig       *tls.Config
 	saslEnabled     bool
-	saslUsers       map[string]string // username -> password
+	saslMechanisms  []string                           // List of enabled SASL mechanisms (in order)
+	saslUsers       map[string]string                  // username -> password (for PLAIN)
+	scramSHA256     map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-256)
+	scramSHA512     map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-512)
 	timeout         time.Duration
 	maxMessageBytes int
 
@@ -195,6 +222,62 @@ type messageBatch struct {
 	batch   service.MessageBatch
 	ackFn   service.AckFunc
 	resChan chan error
+}
+
+// generateSCRAMCredentials generates SCRAM stored credentials from a plaintext password.
+// This manually generates StoredKey and ServerKey following RFC 5802, compatible with Kafka.
+func generateSCRAMCredentials(mechanism, username, password string) (scram.StoredCredentials, error) {
+	// Generate a random 16-byte salt
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return scram.StoredCredentials{}, fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	// Use 4096 iterations (standard for SCRAM)
+	iterations := 4096
+
+	// Determine hash function based on mechanism
+	var hashFunc func() hash.Hash
+	var keyLen int
+	switch mechanism {
+	case "SCRAM-SHA-256":
+		hashFunc = sha256.New
+		keyLen = sha256.Size
+	case "SCRAM-SHA-512":
+		hashFunc = sha512.New
+		keyLen = sha512.Size
+	default:
+		return scram.StoredCredentials{}, fmt.Errorf("unsupported mechanism: %s", mechanism)
+	}
+
+	// Derive SaltedPassword using PBKDF2
+	// SaltedPassword = PBKDF2(password, salt, iterations, keyLen)
+	saltedPassword := pbkdf2.Key([]byte(password), salt, iterations, keyLen, hashFunc)
+
+	// Compute ClientKey = HMAC(SaltedPassword, "Client Key")
+	clientKeyHMAC := hmac.New(hashFunc, saltedPassword)
+	clientKeyHMAC.Write([]byte("Client Key"))
+	clientKey := clientKeyHMAC.Sum(nil)
+
+	// Compute StoredKey = Hash(ClientKey)
+	storedKeyHash := hashFunc()
+	storedKeyHash.Write(clientKey)
+	storedKey := storedKeyHash.Sum(nil)
+
+	// Compute ServerKey = HMAC(SaltedPassword, "Server Key")
+	serverKeyHMAC := hmac.New(hashFunc, saltedPassword)
+	serverKeyHMAC.Write([]byte("Server Key"))
+	serverKey := serverKeyHMAC.Sum(nil)
+
+	// Return credentials in xdg-go/scram format
+	return scram.StoredCredentials{
+		KeyFactors: scram.KeyFactors{
+			Salt:  string(salt), // Salt as string for map key compatibility
+			Iters: iterations,
+		},
+		StoredKey: storedKey,
+		ServerKey: serverKey,
+	}, nil
 }
 
 func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) (*kafkaServerInput, error) {
@@ -236,15 +319,22 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 		}
 
 		k.saslUsers = make(map[string]string)
+		k.scramSHA256 = make(map[string]scram.StoredCredentials)
+		k.scramSHA512 = make(map[string]scram.StoredCredentials)
+		mechanismSet := make(map[string]bool)
+
 		for i, saslConf := range saslList {
 			mechanism, err := saslConf.FieldString("mechanism")
 			if err != nil {
 				return nil, fmt.Errorf("SASL config %d: %w", i, err)
 			}
 
-			// Only support PLAIN for now
-			if mechanism != "PLAIN" {
-				return nil, fmt.Errorf("SASL config %d: unsupported mechanism %q (only PLAIN is supported)", i, mechanism)
+			// Validate mechanism
+			switch mechanism {
+			case "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512":
+				// Supported
+			default:
+				return nil, fmt.Errorf("SASL config %d: unsupported mechanism %q (supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)", i, mechanism)
 			}
 
 			username, err := saslConf.FieldString("username")
@@ -261,13 +351,45 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 				return nil, fmt.Errorf("SASL config %d: username cannot be empty", i)
 			}
 
-			k.saslUsers[username] = password
-			k.logger.Infof("Registered SASL PLAIN user: %s", username)
+			// Store credentials based on mechanism
+			switch mechanism {
+			case "PLAIN":
+				k.saslUsers[username] = password
+				k.logger.Infof("Registered SASL PLAIN user: %s", username)
+			case "SCRAM-SHA-256":
+				creds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+				if err != nil {
+					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-256 credentials: %w", i, err)
+				}
+				k.scramSHA256[username] = creds
+				k.logger.Infof("Registered SASL SCRAM-SHA-256 user: %s", username)
+			case "SCRAM-SHA-512":
+				creds, err := generateSCRAMCredentials("SCRAM-SHA-512", username, password)
+				if err != nil {
+					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-512 credentials: %w", i, err)
+				}
+				k.scramSHA512[username] = creds
+				k.logger.Infof("Registered SASL SCRAM-SHA-512 user: %s", username)
+			}
+
+			// Track unique mechanisms
+			mechanismSet[mechanism] = true
 		}
 
-		k.saslEnabled = len(k.saslUsers) > 0
+		// Build list of enabled mechanisms in priority order (SCRAM preferred over PLAIN)
+		if mechanismSet["SCRAM-SHA-512"] {
+			k.saslMechanisms = append(k.saslMechanisms, "SCRAM-SHA-512")
+		}
+		if mechanismSet["SCRAM-SHA-256"] {
+			k.saslMechanisms = append(k.saslMechanisms, "SCRAM-SHA-256")
+		}
+		if mechanismSet["PLAIN"] {
+			k.saslMechanisms = append(k.saslMechanisms, "PLAIN")
+		}
+
+		k.saslEnabled = len(k.saslMechanisms) > 0
 		if k.saslEnabled {
-			k.logger.Infof("SASL authentication enabled with %d user(s)", len(k.saslUsers))
+			k.logger.Infof("SASL authentication enabled with mechanisms: %v", k.saslMechanisms)
 		}
 	}
 
@@ -370,6 +492,13 @@ func (k *kafkaServerInput) acceptLoop() {
 	}
 }
 
+// connectionState tracks per-connection authentication state
+type connectionState struct {
+	authenticated     bool
+	scramConversation *scram.ServerConversation // For SCRAM multi-step auth
+	scramMechanism    string                     // Which SCRAM mechanism is being used
+}
+
 func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 	// Generate unique connection ID for structured logging
 	connID := k.connCounter.Add(1)
@@ -385,7 +514,9 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 
 	// Track authentication state for this connection
 	// If SASL is disabled, consider the connection authenticated
-	authenticated := !k.saslEnabled
+	connState := &connectionState{
+		authenticated: !k.saslEnabled,
+	}
 
 	for {
 		select {
@@ -427,20 +558,20 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 		}
 
 		// Parse and handle request (may update authenticated state)
-		authUpdated, err := k.handleRequest(conn, connID, remoteAddr, requestData, &authenticated)
+		authUpdated, err := k.handleRequest(conn, connID, remoteAddr, requestData, connState)
 		if err != nil {
 			k.logger.Errorf("[conn:%d] Failed to handle request: %v", connID, err)
 			return
 		}
 
 		// If authentication was just completed, log it
-		if authUpdated && authenticated {
+		if authUpdated && connState.authenticated {
 			k.logger.Infof("[conn:%d] Client authenticated successfully", connID)
 		}
 	}
 }
 
-func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAddr string, data []byte, authenticated *bool) (bool, error) {
+func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAddr string, data []byte, connState *connectionState) (bool, error) {
 	// Parse request header using kmsg types
 	if len(data) < 8 {
 		k.logger.Errorf("[conn:%d] Request too small: %d bytes", connID, len(data))
@@ -456,7 +587,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 	k.logger.Debugf("[conn:%d] Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", connID, apiKey, apiVersion, correlationID, len(data))
 
 	// Check if client needs authentication first (only if SASL is enabled)
-	if k.saslEnabled && !*authenticated {
+	if k.saslEnabled && !connState.authenticated {
 		// Only allow ApiVersions, SASLHandshake, and SASLAuthenticate before authentication
 		switch kmsg.Key(apiKey) {
 		case kmsg.ApiVersions, kmsg.SASLHandshake, kmsg.SASLAuthenticate:
@@ -527,14 +658,14 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 	case kmsg.SASLHandshake:
 		// Handle SASL handshake
 		k.logger.Debugf("[conn:%d] Handling SASLHandshake", connID)
-		err = k.handleSaslHandshake(conn, connID, correlationID, data[offset:], apiVersion)
+		err = k.handleSaslHandshake(conn, connID, correlationID, data[offset:], apiVersion, connState)
 	case kmsg.SASLAuthenticate:
 		// Handle SASL authentication
 		k.logger.Debugf("[conn:%d] Handling SASLAuthenticate", connID)
 		authSuccess := false
-		authSuccess, err = k.handleSaslAuthenticate(conn, connID, correlationID, data[offset:], apiVersion)
+		authSuccess, err = k.handleSaslAuthenticate(conn, connID, correlationID, data[offset:], apiVersion, connState)
 		if err == nil && authSuccess {
-			*authenticated = true
+			connState.authenticated = true
 			authUpdated = true
 		}
 	case kmsg.Metadata:
@@ -583,7 +714,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 	return authUpdated, err
 }
 
-func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, correlationID int32, data []byte, apiVersion int16) error {
+func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, correlationID int32, data []byte, apiVersion int16, connState *connectionState) error {
 	req := kmsg.NewSASLHandshakeRequest()
 	req.SetVersion(apiVersion)
 	resp := kmsg.NewSASLHandshakeResponse()
@@ -595,38 +726,51 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, cor
 		k.logger.Errorf("[conn:%d] Failed to parse SASL handshake request: %v", connID, err)
 		// Send proper error response instead of generic error
 		resp.ErrorCode = kerr.InvalidRequest.Code
-		resp.SupportedMechanisms = []string{"PLAIN"}
+		resp.SupportedMechanisms = k.saslMechanisms
 		return k.sendResponse(conn, connID, correlationID, &resp)
 	}
 
-	// Check if requested mechanism is PLAIN (the only one we support)
-	if req.Mechanism == "PLAIN" {
-		k.logger.Debugf("[conn:%d] SASL mechanism PLAIN requested", connID)
+	k.logger.Debugf("[conn:%d] SASL mechanism %s requested", connID, req.Mechanism)
+
+	// Check if requested mechanism is supported
+	supported := false
+	for _, mech := range k.saslMechanisms {
+		if req.Mechanism == mech {
+			supported = true
+			break
+		}
+	}
+
+	if supported {
+		k.logger.Debugf("[conn:%d] SASL mechanism %s accepted", connID, req.Mechanism)
 		resp.ErrorCode = 0
-		resp.SupportedMechanisms = []string{"PLAIN"}
+		resp.SupportedMechanisms = k.saslMechanisms
+		// Store the mechanism for this connection
+		connState.scramMechanism = req.Mechanism
 	} else {
 		k.logger.Warnf("[conn:%d] Unsupported SASL mechanism requested: %s", connID, req.Mechanism)
 		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
-		resp.SupportedMechanisms = []string{"PLAIN"}
+		resp.SupportedMechanisms = k.saslMechanisms
 	}
 
 	return k.sendResponse(conn, connID, correlationID, &resp)
 }
 
-func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, correlationID int32, data []byte, apiVersion int16) (bool, error) {
-	// Create response first for proper error handling
-	resp := kmsg.NewSASLAuthenticateResponse()
-	resp.SetVersion(apiVersion)
+func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, correlationID int32, data []byte, apiVersion int16, connState *connectionState) (bool, error) {
+	// Create response using kmsg (like kfake does)
+	req := kmsg.NewSASLAuthenticateRequest()
+	req.SetVersion(apiVersion)
+	resp := req.ResponseKind().(*kmsg.SASLAuthenticateResponse)
 
-	// Manually parse SASL auth bytes
-	// Format for v2: INT16 length + auth_bytes + TAG_BUFFER (for flexible)
+	// Manually parse SASL auth bytes from request body
+	// SASLAuthenticate v2 body format: BYTES (int16 length + data) + TAG_BUFFER
 	if len(data) < 2 {
 		k.logger.Errorf("[conn:%d] SASL authenticate data too short", connID)
 		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
 		errMsg := "SASL authenticate data too short"
 		resp.ErrorMessage = &errMsg
-		err := k.sendResponse(conn, connID, correlationID, &resp)
-		return false, err
+		sendErr := k.sendResponse(conn, connID, correlationID, resp)
+		return false, sendErr
 	}
 
 	b := kbin.Reader{Src: data}
@@ -636,27 +780,153 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
 		errMsg := fmt.Sprintf("Invalid SASL auth bytes length: %d", authLen)
 		resp.ErrorMessage = &errMsg
-		err := k.sendResponse(conn, connID, correlationID, &resp)
-		return false, err
+		sendErr := k.sendResponse(conn, connID, correlationID, resp)
+		return false, sendErr
 	}
 
 	authBytes := b.Span(int(authLen))
 
-	// Validate PLAIN credentials
-	authenticated := k.validatePlain(connID, authBytes)
+	var authenticated bool
 
-	if authenticated {
-		resp.ErrorCode = 0
-		k.logger.Debugf("[conn:%d] SASL authentication succeeded", connID)
-	} else {
-		k.logger.Warnf("[conn:%d] SASL authentication failed", connID)
+	// Handle authentication based on mechanism
+	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: mechanism=%s, authBytes len=%d", connID, connState.scramMechanism, len(authBytes))
+	switch connState.scramMechanism {
+	case "PLAIN":
+		// Validate PLAIN credentials
+		authenticated = k.validatePlain(connID, authBytes)
+		if authenticated {
+			resp.ErrorCode = 0
+			k.logger.Debugf("[conn:%d] SASL PLAIN authentication succeeded", connID)
+		} else {
+			k.logger.Warnf("[conn:%d] SASL PLAIN authentication failed", connID)
+			resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
+			errMsg := "Authentication failed"
+			resp.ErrorMessage = &errMsg
+		}
+
+	case "SCRAM-SHA-256", "SCRAM-SHA-512":
+		// Handle SCRAM challenge-response
+		var authErr error
+		authenticated, authErr = k.handleSCRAMAuth(connID, authBytes, connState, resp)
+		if authErr != nil {
+			k.logger.Errorf("[conn:%d] SCRAM authentication error: %v", connID, authErr)
+			resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
+			errMsg := authErr.Error()
+			resp.ErrorMessage = &errMsg
+			authenticated = false
+		}
+
+	default:
+		k.logger.Errorf("[conn:%d] Unknown SASL mechanism: %s", connID, connState.scramMechanism)
 		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
-		errMsg := "Authentication failed"
+		errMsg := "Unknown SASL mechanism"
 		resp.ErrorMessage = &errMsg
+		authenticated = false
 	}
 
-	err := k.sendResponse(conn, connID, correlationID, &resp)
-	return authenticated, err
+	sendErr := k.sendResponse(conn, connID, correlationID, resp)
+	return authenticated, sendErr
+}
+
+// handleSCRAMAuth handles SCRAM challenge-response authentication
+func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
+	clientMessage := string(authBytes)
+
+	// If this is the first message (no conversation yet), create one
+	if connState.scramConversation == nil {
+		k.logger.Infof("[conn:%d] SCRAM Step 1: Starting new SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
+		k.logger.Infof("[conn:%d] SCRAM Step 1: Client first message (len=%d): %s", connID, len(clientMessage), clientMessage)
+
+		// Create credential lookup function
+		var credLookup scram.CredentialLookup
+		if connState.scramMechanism == "SCRAM-SHA-256" {
+			credLookup = func(username string) (scram.StoredCredentials, error) {
+				k.logger.Infof("[conn:%d] SCRAM credential lookup for user: %s", connID, username)
+				creds, ok := k.scramSHA256[username]
+				if !ok {
+					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
+					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
+				}
+				k.logger.Infof("[conn:%d] Found credentials for user: %s (StoredKey len=%d, ServerKey len=%d)",
+					connID, username, len(creds.StoredKey), len(creds.ServerKey))
+				return creds, nil
+			}
+		} else if connState.scramMechanism == "SCRAM-SHA-512" {
+			credLookup = func(username string) (scram.StoredCredentials, error) {
+				k.logger.Infof("[conn:%d] SCRAM credential lookup for user: %s", connID, username)
+				creds, ok := k.scramSHA512[username]
+				if !ok {
+					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
+					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
+				}
+				k.logger.Infof("[conn:%d] Found credentials for user: %s (StoredKey len=%d, ServerKey len=%d)",
+					connID, username, len(creds.StoredKey), len(creds.ServerKey))
+				return creds, nil
+			}
+		} else {
+			return false, fmt.Errorf("unsupported SCRAM mechanism: %s", connState.scramMechanism)
+		}
+
+		// Create SCRAM server based on mechanism
+		var scramServer *scram.Server
+		var err error
+		if connState.scramMechanism == "SCRAM-SHA-256" {
+			scramServer, err = scram.SHA256.NewServer(credLookup)
+		} else {
+			scramServer, err = scram.SHA512.NewServer(credLookup)
+		}
+
+		if err != nil {
+			k.logger.Errorf("[conn:%d] Failed to create SCRAM server: %v", connID, err)
+			return false, fmt.Errorf("failed to create SCRAM server: %w", err)
+		}
+
+		// Start new conversation
+		connState.scramConversation = scramServer.NewConversation()
+		k.logger.Infof("[conn:%d] Created SCRAM conversation", connID)
+	} else {
+		k.logger.Infof("[conn:%d] SCRAM Step 2: Processing client final message (len=%d): %s", connID, len(clientMessage), clientMessage)
+	}
+
+	// Process the client message
+	k.logger.Infof("[conn:%d] Calling conversation.Step with message: %s", connID, clientMessage)
+	k.logger.Infof("[conn:%d] Client message hex: %x", connID, authBytes)
+	serverMessage, err := connState.scramConversation.Step(clientMessage)
+	if err != nil {
+		k.logger.Errorf("[conn:%d] SCRAM conversation step failed: %v", connID, err)
+		return false, fmt.Errorf("authentication failed: %w", err)
+	}
+	k.logger.Infof("[conn:%d] Server response (len=%d): %s", connID, len(serverMessage), serverMessage)
+	k.logger.Infof("[conn:%d] Server response hex: %x", connID, []byte(serverMessage))
+
+	// Log byte 44 specifically if the message is long enough
+	if len(serverMessage) > 44 {
+		k.logger.Infof("[conn:%d] Byte 44 of server response: 0x%02x ('%c')", connID, serverMessage[44], serverMessage[44])
+		k.logger.Infof("[conn:%d] Bytes 40-50: %q hex:%x", connID, serverMessage[40:51], serverMessage[40:51])
+	}
+
+	// Set server response
+	resp.SASLAuthBytes = []byte(serverMessage)
+	resp.ErrorCode = 0
+
+	k.logger.Infof("[conn:%d] About to send response, SASLAuthBytes len=%d: %q", connID, len(resp.SASLAuthBytes), string(resp.SASLAuthBytes))
+	fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d About to send response, SASLAuthBytes len=%d: %q\n", connID, len(resp.SASLAuthBytes), string(resp.SASLAuthBytes))
+
+	// Check if conversation is complete
+	if connState.scramConversation.Done() {
+		k.logger.Infof("[conn:%d] SCRAM conversation is DONE, checking validity...", connID)
+		if connState.scramConversation.Valid() {
+			k.logger.Infof("[conn:%d] SCRAM authentication SUCCEEDED", connID)
+			return true, nil
+		} else {
+			k.logger.Warnf("[conn:%d] SCRAM authentication FAILED: invalid credentials", connID)
+			return false, fmt.Errorf("invalid credentials")
+		}
+	}
+
+	// Conversation continues (need more steps)
+	k.logger.Infof("[conn:%d] SCRAM conversation continues (not done yet)", connID)
+	return false, nil
 }
 
 // validatePlain validates PLAIN SASL credentials
@@ -1129,9 +1399,21 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, connID uint64, correlatio
 	}
 
 	// AppendTo generates the response body
+	bufBeforeAppend := len(buf)
 	buf = msg.AppendTo(buf)
 
-	k.logger.Debugf("[conn:%d] Sending response: correlationID=%d, flexible=%v, key=%d, total_size=%d", connID, correlationID, msg.IsFlexible(), msg.Key(), len(buf))
+	k.logger.Debugf("[conn:%d] Sending response: correlationID=%d, flexible=%v, key=%d, total_size=%d, body_size=%d", connID, correlationID, msg.IsFlexible(), msg.Key(), len(buf), len(buf)-bufBeforeAppend)
+
+	// Log the response body for SASLAuthenticate
+	if msg.Key() == int16(kmsg.SASLAuthenticate) {
+		bodyHexLen := len(buf) - bufBeforeAppend
+		if bodyHexLen > 100 {
+			bodyHexLen = 100
+		}
+		k.logger.Infof("[conn:%d] SASLAuthenticate response body (first %d bytes): %x", connID, bodyHexLen, buf[bufBeforeAppend:bufBeforeAppend+bodyHexLen])
+		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d SASLAuthenticate response body (first %d bytes): %x\n", connID, bodyHexLen, buf[bufBeforeAppend:bufBeforeAppend+bodyHexLen])
+		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Full buffer hex: %x\n", connID, buf)
+	}
 
 	return k.writeResponse(connID, conn, buf)
 }

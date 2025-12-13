@@ -13,6 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
 
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -946,4 +947,246 @@ sasl:
 	// Should get an error due to missing authentication
 	assert.Error(t, results[0].Err)
 	t.Logf("Expected authentication error received: %v", results[0].Err)
+}
+
+func TestKafkaServerInputSCRAMSHA256(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SCRAM-SHA-256 authentication
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19103"
+sasl:
+  - mechanism: SCRAM-SHA-256
+    username: "scramuser"
+    password: "scrampass"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create client with SCRAM-SHA-256 authentication
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19103"),
+		kgo.SASL(scram.Sha256(func(context.Context) (scram.Auth, error) {
+			t.Logf("SCRAM-SHA-256 auth callback called")
+			return scram.Auth{
+				User: "scramuser",
+				Pass: "scrampass",
+			}, nil
+		})),
+		kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+			return "[CLIENT] "
+		})),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	t.Logf("Client created successfully")
+
+	// Produce a message
+	testTopic := "test-topic"
+	testValue := "test-value-scram"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	// Use channel to synchronize producer and consumer
+	produceChan := make(chan error, 1)
+	go func() {
+		results := client.ProduceSync(ctx, record)
+		if len(results) > 0 {
+			produceChan <- results[0].Err
+		}
+	}()
+
+	// Read message from input
+	batch, ackFn, err := input.ReadBatch(ctx)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msg := batch[0]
+
+	// Verify message content
+	msgBytes, err := msg.AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, testValue, string(msgBytes))
+
+	// Verify metadata
+	topic, exists := msg.MetaGet("kafka_server_topic")
+	assert.True(t, exists)
+	assert.Equal(t, testTopic, topic)
+
+	// Acknowledge the message
+	err = ackFn(ctx, nil)
+	require.NoError(t, err)
+
+	// Verify producer received acknowledgment
+	select {
+	case err := <-produceChan:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for produce acknowledgment")
+	}
+}
+
+func TestKafkaServerInputSCRAMSHA512(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SCRAM-SHA-512 authentication
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19104"
+sasl:
+  - mechanism: SCRAM-SHA-512
+    username: "scramuser512"
+    password: "scrampass512"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create client with SCRAM-SHA-512 authentication
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19104"),
+		kgo.SASL(scram.Sha512(func(context.Context) (scram.Auth, error) {
+			return scram.Auth{
+				User: "scramuser512",
+				Pass: "scrampass512",
+			}, nil
+		})),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Produce a message
+	testTopic := "test-topic-512"
+	testValue := "test-value-scram-512"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	// Use channel to synchronize producer and consumer
+	produceChan := make(chan error, 1)
+	go func() {
+		results := client.ProduceSync(ctx, record)
+		if len(results) > 0 {
+			produceChan <- results[0].Err
+		}
+	}()
+
+	// Read message from input
+	batch, ackFn, err := input.ReadBatch(ctx)
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msg := batch[0]
+
+	// Verify message content
+	msgBytes, err := msg.AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, testValue, string(msgBytes))
+
+	// Verify metadata
+	topic, exists := msg.MetaGet("kafka_server_topic")
+	assert.True(t, exists)
+	assert.Equal(t, testTopic, topic)
+
+	// Acknowledge the message
+	err = ackFn(ctx, nil)
+	require.NoError(t, err)
+
+	// Verify producer received acknowledgment
+	select {
+	case err := <-produceChan:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for produce acknowledgment")
+	}
+}
+
+func TestKafkaServerInputSCRAMFailedAuth(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create kafka_server input with SCRAM-SHA-256 authentication
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19105"
+sasl:
+  - mechanism: SCRAM-SHA-256
+    username: "validuser"
+    password: "validpass"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create client with WRONG credentials
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19105"),
+		kgo.SASL(scram.Sha256(func(context.Context) (scram.Auth, error) {
+			return scram.Auth{
+				User: "validuser",
+				Pass: "wrongpass",
+			}, nil
+		})),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Try to produce a message - should fail
+	testTopic := "test-topic"
+	testValue := "test-value"
+
+	record := &kgo.Record{
+		Topic: testTopic,
+		Value: []byte(testValue),
+	}
+
+	results := client.ProduceSync(ctx, record)
+	require.Len(t, results, 1)
+
+	// Should get an authentication error
+	assert.Error(t, results[0].Err)
+	t.Logf("Expected SCRAM authentication error received: %v", results[0].Err)
 }
