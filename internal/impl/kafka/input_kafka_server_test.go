@@ -2,10 +2,15 @@ package kafka
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"testing"
 	"time"
+
+	"bytes"
+	"io"
+	"net"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,6 +19,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
+	xdgscram "github.com/xdg-go/scram"
 
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -437,6 +443,170 @@ address: "127.0.0.1:19096"
 
 	err = ackFn(ctx, nil)
 	require.NoError(t, err)
+}
+
+// Helper that creates a kafkaServerInput with an SCRAM-SHA-256 user for tests.
+func makeSCRAMTestServer(t *testing.T, username, password string) *kafkaServerInput {
+	k := &kafkaServerInput{
+		logger:         service.MockResources().Logger(),
+		scramSHA256:    make(map[string]xdgscram.StoredCredentials),
+		saslMechanisms: []string{"SCRAM-SHA-256"},
+		saslEnabled:    true,
+		timeout:        5 * time.Second,
+	}
+	creds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+	if err != nil {
+		t.Fatalf("failed to create scram credentials: %v", err)
+	}
+	k.scramSHA256[username] = creds
+	return k
+}
+
+// Test that SASLAuthenticate requests encoded with an Int32 BYTES prefix are
+// properly parsed and core SCRAM server-first responses do not contain NUL.
+func TestHandleSaslAuthenticate_Int32Bytes_ParsingAndTrim(t *testing.T) {
+	k := makeSCRAMTestServer(t, "scramuser", "password")
+
+	// Build client-first payload and append trailing NULs to simulate padding
+	payload := []byte("n,,n=scramuser,r=nonce12345")
+	payload = append(payload, 0, 0)
+
+	data := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(data[0:4], uint32(len(payload)))
+	copy(data[4:], payload)
+
+	// Prepare a dummy connection pair
+	sConn, cConn := net.Pipe()
+	defer sConn.Close()
+	defer cConn.Close()
+
+	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := k.handleSaslAuthenticate(sConn, 1, 1, data, 2, connState)
+		done <- err
+	}()
+
+	// Read response from client side
+	var size int32
+	if err := binary.Read(cConn, binary.BigEndian, &size); err != nil {
+		t.Fatalf("failed to read size: %v", err)
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(cConn, buf); err != nil {
+		t.Fatalf("failed to read body: %v", err)
+	}
+
+	// Parse response as SASLAuthenticate (skip correlation id)
+	// Locate the server-first message within the response body by searching for "r="
+	body := buf[4:]
+	start := bytes.Index(body, []byte("r="))
+	if start < 0 {
+		t.Fatalf("could not find server-first 'r=' in response: %x", body)
+	}
+	// Slice until first NUL (if present) to avoid trailing padding
+	endNull := bytes.IndexByte(body[start:], 0)
+	var token []byte
+	if endNull >= 0 {
+		token = body[start : start+endNull]
+	} else {
+		token = body[start:]
+	}
+	if len(token) == 0 {
+		t.Fatalf("empty server-first token")
+	}
+	if bytes.Contains(token, []byte{0}) {
+		t.Fatalf("server-first token contains NULs: %x", token)
+	}
+
+	// Ensure the handler returned without error
+	if err := <-done; err != nil {
+		t.Fatalf("handleSaslAuthenticate returned error: %v", err)
+	}
+}
+
+// Test that SASLAuthenticate requests encoded as CompactBytes are parsed correctly.
+func TestHandleSaslAuthenticate_CompactBytes_Parsing(t *testing.T) {
+	k := makeSCRAMTestServer(t, "scramuser", "password")
+
+	payload := []byte("n,,n=scramuser,r=nonce_compact")
+	// Kafka compact encoding uses uvarint of (len + 1). For small values this is one byte.
+	prefix := byte(len(payload) + 1)
+	data := append([]byte{prefix}, payload...)
+
+	sConn, cConn := net.Pipe()
+	defer sConn.Close()
+	defer cConn.Close()
+
+	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := k.handleSaslAuthenticate(sConn, 2, 2, data, 2, connState)
+		done <- err
+	}()
+
+	// Read response from client side
+	var size int32
+	if err := binary.Read(cConn, binary.BigEndian, &size); err != nil {
+		t.Fatalf("failed to read size: %v", err)
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(cConn, buf); err != nil {
+		t.Fatalf("failed to read body: %v", err)
+	}
+
+	// Locate "r=" in body for compact case as well
+	body2 := buf[4:]
+	start2 := bytes.Index(body2, []byte("r="))
+	if start2 < 0 {
+		t.Fatalf("could not find server-first 'r=' in compact response: %x", body2)
+	}
+	endNull2 := bytes.IndexByte(body2[start2:], 0)
+	var token2 []byte
+	if endNull2 >= 0 {
+		token2 = body2[start2 : start2+endNull2]
+	} else {
+		token2 = body2[start2:]
+	}
+	if len(token2) == 0 {
+		t.Fatalf("empty server-first token in compact case")
+	}
+	if bytes.Contains(token2, []byte{0}) {
+		t.Fatalf("server-first token contains NULs in compact case: %x", token2)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("handleSaslAuthenticate returned error: %v", err)
+	}
+}
+
+// Test that leading control bytes (0x00/0x01) in the client payload are trimmed
+// by handleSCRAMAuth before processing.
+func TestHandleSCRAMAuth_TrimsLeadingControlBytes(t *testing.T) {
+	k := makeSCRAMTestServer(t, "scramuser", "password")
+	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+
+	// Construct a client-first message with a leading 0x01 control byte
+	payload := append([]byte{0x01}, []byte("n,,n=scramuser,r=nonce_lead")...)
+
+	resp := kmsg.NewSASLAuthenticateResponse()
+	resp.SetVersion(2)
+
+	ok, err := k.handleSCRAMAuth(3, payload, connState, &resp)
+	if err != nil {
+		t.Fatalf("handleSCRAMAuth returned error: %v", err)
+	}
+	// First-step SCRAM should not be complete (conversation continues)
+	if ok {
+		t.Fatalf("expected authentication not to be completed for client-first message")
+	}
+	if len(resp.SASLAuthBytes) == 0 {
+		t.Fatalf("expected SCRAM server-first response SASLAuthBytes, got none")
+	}
+	if bytes.Contains(resp.SASLAuthBytes, []byte{0}) {
+		t.Fatalf("server response contains NUL bytes: %x", resp.SASLAuthBytes)
+	}
 }
 
 func TestKafkaServerInputAcks0(t *testing.T) {

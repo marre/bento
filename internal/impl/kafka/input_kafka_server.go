@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"strings"
+
 	"github.com/Jeffail/shutdown"
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -270,9 +272,12 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 	serverKey := serverKeyHMAC.Sum(nil)
 
 	// Return credentials in xdg-go/scram format
+	// Salt must be stored as raw bytes (in the string). The xdg-go SCRAM
+	// library will Base64 encode the salt when emitting the server-first
+	// message, so we store the salt as raw bytes in the string.
 	return scram.StoredCredentials{
 		KeyFactors: scram.KeyFactors{
-			Salt:  string(salt), // Salt as string for map key compatibility
+			Salt:  string(salt),
 			Iters: iterations,
 		},
 		StoredKey: storedKey,
@@ -496,7 +501,7 @@ func (k *kafkaServerInput) acceptLoop() {
 type connectionState struct {
 	authenticated     bool
 	scramConversation *scram.ServerConversation // For SCRAM multi-step auth
-	scramMechanism    string                     // Which SCRAM mechanism is being used
+	scramMechanism    string                    // Which SCRAM mechanism is being used
 }
 
 func (k *kafkaServerInput) handleConnection(conn net.Conn) {
@@ -662,6 +667,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 	case kmsg.SASLAuthenticate:
 		// Handle SASL authentication
 		k.logger.Debugf("[conn:%d] Handling SASLAuthenticate", connID)
+		k.logger.Debugf("[conn:%d] SASLAuthenticate body offset=%d len=%d first bytes: %x", connID, offset, len(data[offset:]), data[offset:min(offset+40, len(data))])
 		authSuccess := false
 		authSuccess, err = k.handleSaslAuthenticate(conn, connID, correlationID, data[offset:], apiVersion, connState)
 		if err == nil && authSuccess {
@@ -762,29 +768,87 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 	req.SetVersion(apiVersion)
 	resp := req.ResponseKind().(*kmsg.SASLAuthenticateResponse)
 
-	// Manually parse SASL auth bytes from request body
-	// SASLAuthenticate v2 body format: BYTES (int16 length + data) + TAG_BUFFER
-	if len(data) < 2 {
-		k.logger.Errorf("[conn:%d] SASL authenticate data too short", connID)
-		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
-		errMsg := "SASL authenticate data too short"
-		resp.ErrorMessage = &errMsg
-		sendErr := k.sendResponse(conn, connID, correlationID, resp)
-		return false, sendErr
+	// Parse the SASLAuthenticate request body using kmsg's ReadFrom from the body slice
+	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: incoming body len=%d, apiVersion=%d, content %x", connID, len(data), apiVersion, data[:min(len(data), 80)])
+	fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d handleSaslAuthenticate body len=%d apiVersion=%d hex:%x\n", connID, len(data), apiVersion, data[:min(len(data), 200)])
+	// This handles different API versions (including flexible v2 body formats) correctly
+
+	// Robustly parse auth bytes. Different clients and API versions may encode this
+	// field as Int32-length BYTES, CompactBytes (uvarint length), or in some cases
+	// legacy int16 length. Try the common encodings in order and fall back when
+	// necessary.
+	var authBytes []byte
+	// Try Int32 BYTES (big-endian) first if enough length to read int32
+	if len(data) >= 4 {
+		ln := int(binary.BigEndian.Uint32(data[0:4]))
+		if ln >= 0 && ln <= len(data)-4 {
+			authBytes = data[4 : 4+ln]
+			k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Int32 BYTES (len=%d)", connID, ln)
+		}
 	}
 
-	b := kbin.Reader{Src: data}
-	authLen := b.Int16()
-	if authLen < 0 || int(authLen) > len(b.Src) {
-		k.logger.Errorf("[conn:%d] Invalid SASL auth bytes length: %d", connID, authLen)
-		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
-		errMsg := fmt.Sprintf("Invalid SASL auth bytes length: %d", authLen)
-		resp.ErrorMessage = &errMsg
-		sendErr := k.sendResponse(conn, connID, correlationID, resp)
-		return false, sendErr
+	// If Int32 parse failed, try compact bytes (uvarint length - 1)
+	if authBytes == nil {
+		if uval, n := kbin.Uvarint(data); n > 0 {
+			ln := int(uval) - 1
+			if ln >= 0 && n+ln <= len(data) {
+				authBytes = data[n : n+ln]
+				k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as CompactBytes (len=%d)", connID, ln)
+			}
+		}
 	}
 
-	authBytes := b.Span(int(authLen))
+	// If still nil, try int16 (some clients historically used int16 length)
+	if authBytes == nil && len(data) >= 2 {
+		ln := int(binary.BigEndian.Uint16(data[0:2]))
+		if ln >= 0 && ln <= len(data)-2 {
+			authBytes = data[2 : 2+ln]
+			k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Int16 (len=%d)", connID, ln)
+		}
+	}
+
+	// As a last resort, attempt to use the kbin.Reader helper (Bytes)
+	if authBytes == nil {
+		b := kbin.Reader{Src: data}
+		authBytes = b.Bytes()
+		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as fallback Bytes() (len=%d)", connID, len(authBytes))
+	}
+
+	// Heuristics: validate parsed authBytes appear to be a SCRAM message
+	// for the expected step; if not, attempt alternative parses. This
+	// handles clients that use variable encodings across API versions.
+	isClientFirst := connState.scramConversation == nil
+	if !looksLikeScramPayload(authBytes, isClientFirst) {
+		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes didn't look like SCRAM payload, trying alternate parses", connID)
+		// Try other parses in order
+		tried := map[string]bool{"int32": authBytes != nil}
+		// try compact
+		if !tried["compact"] && len(data) > 0 {
+			if uval, n := kbin.Uvarint(data); n > 0 {
+				ln := int(uval) - 1
+				if ln >= 0 && n+ln <= len(data) {
+					alt := data[n : n+ln]
+					if looksLikeScramPayload(alt, isClientFirst) {
+						authBytes = alt
+					}
+				}
+			}
+		}
+		// try int16
+		if !looksLikeScramPayload(authBytes, isClientFirst) && len(data) >= 2 {
+			ln := int(binary.BigEndian.Uint16(data[0:2]))
+			if ln >= 0 && ln <= len(data)-2 {
+				alt := data[2 : 2+ln]
+				if looksLikeScramPayload(alt, isClientFirst) {
+					authBytes = alt
+				}
+			}
+		}
+	}
+	// Trim any trailing NUL bytes that may be present due to client encoding quirks.
+	// Some clients/implementations pad or include null bytes; removing them enables
+	// compatibility with different client libraries.
+	authBytes = bytes.TrimRight(authBytes, "\x00")
 
 	var authenticated bool
 
@@ -830,6 +894,17 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 
 // handleSCRAMAuth handles SCRAM challenge-response authentication
 func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
+	// Remove any leading control bytes that may appear from Kafka compact encodings
+	// (e.g., a leading 0x01 from compact string length). This avoids breaking
+	// SCRAM parsing that expects ASCII fields like "c=" and "n=", etc.
+	if len(authBytes) > 0 && (authBytes[0] == 0x00 || authBytes[0] == 0x01) {
+		// Trim leading 0x00/0x01 bytes until first printable ASCII
+		idx := 0
+		for idx < len(authBytes) && (authBytes[idx] == 0x00 || authBytes[idx] == 0x01) {
+			idx++
+		}
+		authBytes = authBytes[idx:]
+	}
 	clientMessage := string(authBytes)
 
 	// If this is the first message (no conversation yet), create one
@@ -891,18 +966,34 @@ func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, conn
 	// Process the client message
 	k.logger.Infof("[conn:%d] Calling conversation.Step with message: %s", connID, clientMessage)
 	k.logger.Infof("[conn:%d] Client message hex: %x", connID, authBytes)
+	clientTokens := strings.Split(clientMessage, ",")
+	for i, t := range clientTokens {
+		k.logger.Infof("[conn:%d] Client token %d: %q (hex: %x)", connID, i, t, []byte(t))
+		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Client token %d: %q (hex: %x)\n", connID, i, t, []byte(t))
+	}
 	serverMessage, err := connState.scramConversation.Step(clientMessage)
 	if err != nil {
 		k.logger.Errorf("[conn:%d] SCRAM conversation step failed: %v", connID, err)
 		return false, fmt.Errorf("authentication failed: %w", err)
 	}
+	// Remove any NUL characters from server message for compatibility with clients
+	if strings.Contains(serverMessage, "\x00") {
+		serverMessage = strings.ReplaceAll(serverMessage, "\x00", "")
+	}
 	k.logger.Infof("[conn:%d] Server response (len=%d): %s", connID, len(serverMessage), serverMessage)
 	k.logger.Infof("[conn:%d] Server response hex: %x", connID, []byte(serverMessage))
+	// Debug: split server message into tokens and print their ASCII and hex forms
+	tokens := strings.Split(serverMessage, ",")
+	for i, t := range tokens {
+		k.logger.Infof("[conn:%d] Server token %d: %q (hex: %x)", connID, i, t, []byte(t))
+		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Server token %d: %q (hex: %x)\n", connID, i, t, []byte(t))
+	}
 
 	// Log byte 44 specifically if the message is long enough
 	if len(serverMessage) > 44 {
 		k.logger.Infof("[conn:%d] Byte 44 of server response: 0x%02x ('%c')", connID, serverMessage[44], serverMessage[44])
-		k.logger.Infof("[conn:%d] Bytes 40-50: %q hex:%x", connID, serverMessage[40:51], serverMessage[40:51])
+		upper := min(51, len(serverMessage))
+		k.logger.Infof("[conn:%d] Bytes 40-50: %q hex:%x", connID, serverMessage[40:upper], serverMessage[40:upper])
 	}
 
 	// Set server response
@@ -927,6 +1018,21 @@ func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, conn
 	// Conversation continues (need more steps)
 	k.logger.Infof("[conn:%d] SCRAM conversation continues (not done yet)", connID)
 	return false, nil
+}
+
+// looksLikeScramPayload checks basic characteristics of auth bytes to ensure
+// they represent the expected SCRAM client-first or client-final message.
+func looksLikeScramPayload(b []byte, isClientFirst bool) bool {
+	if len(b) == 0 {
+		return false
+	}
+	s := string(b)
+	if isClientFirst {
+		// Expect 'n,' or 'n,,n=' patterns
+		return strings.HasPrefix(s, "n,,") || strings.Contains(s, "n=") && strings.Contains(s, "r=")
+	}
+	// client-final expects c=, r= and p=
+	return strings.Contains(s, "c=") && strings.Contains(s, "r=") && strings.Contains(s, "p=")
 }
 
 // validatePlain validates PLAIN SASL credentials
