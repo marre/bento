@@ -814,6 +814,14 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as fallback Bytes() (len=%d)", connID, len(authBytes))
 	}
 
+	// Before heuristics, strip a possible inner length-prefix if present.
+	// Some clients accidentally embed an inner length encoding inside the
+	// BYTES/Compact field; detect and remove it deterministically.
+	if stripped, kind := stripInnerLengthPrefix(authBytes); kind != "" {
+		k.logger.Debugf("[conn:%d] Stripped inner %s prefix from SASL auth bytes (len before=%d, after=%d)", connID, kind, len(authBytes), len(stripped))
+		authBytes = stripped
+	}
+
 	// Heuristics: validate parsed authBytes appear to be a SCRAM message
 	// for the expected step; if not, attempt alternative parses. This
 	// handles clients that use variable encodings across API versions.
@@ -894,16 +902,25 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 
 // handleSCRAMAuth handles SCRAM challenge-response authentication
 func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
-	// Remove any leading control bytes that may appear from Kafka compact encodings
-	// (e.g., a leading 0x01 from compact string length). This avoids breaking
-	// SCRAM parsing that expects ASCII fields like "c=" and "n=", etc.
-	if len(authBytes) > 0 && (authBytes[0] == 0x00 || authBytes[0] == 0x01) {
-		// Trim leading 0x00/0x01 bytes until first printable ASCII
-		idx := 0
-		for idx < len(authBytes) && (authBytes[idx] == 0x00 || authBytes[idx] == 0x01) {
-			idx++
+	// Strip any inner length prefixes (int32/compact/int16) if present. Some
+	// clients send an extra length prefix inside the SASL payload; remove it
+	// deterministically rather than heuristically trimming control bytes.
+	if stripped, kind := stripInnerLengthPrefix(authBytes); kind != "" {
+		k.logger.Debugf("[conn:%d] Stripped inner %s prefix in SCRAM auth (len before=%d, after=%d)", connID, kind, len(authBytes), len(stripped))
+		authBytes = stripped
+	}
+
+	// Some clients (especially with compact encodings) may send a single
+	// leading control byte (0x00 or 0x01) before the SCRAM message. If
+	// removing a single leading byte results in something that looks like a
+	// SCRAM payload, strip that single byte. This preserves correctness
+	// without aggressively trimming arbitrary control bytes.
+	isClientFirst := connState.scramConversation == nil
+	if len(authBytes) > 1 && (authBytes[0] == 0x00 || authBytes[0] == 0x01) {
+		if looksLikeScramPayload(authBytes[1:], isClientFirst) {
+			k.logger.Debugf("[conn:%d] Stripping single leading control byte 0x%02x from SCRAM auth", connID, authBytes[0])
+			authBytes = authBytes[1:]
 		}
-		authBytes = authBytes[idx:]
 	}
 	clientMessage := string(authBytes)
 
@@ -1033,6 +1050,42 @@ func looksLikeScramPayload(b []byte, isClientFirst bool) bool {
 	}
 	// client-final expects c=, r= and p=
 	return strings.Contains(s, "c=") && strings.Contains(s, "r=") && strings.Contains(s, "p=")
+}
+
+// stripInnerLengthPrefix detects and removes an inner length-prefix if the
+// payload contains an embedded length encoding (Int32 BYTES, CompactBytes
+// (uvarint len+1), or Int16) where the decoded length exactly matches the
+// remaining payload. Returns the possibly-stripped slice and a string
+// describing the prefix that was removed ("int32", "compact", "int16")
+// or empty string when no inner prefix was removed.
+func stripInnerLengthPrefix(b []byte) ([]byte, string) {
+	// Check int32 BE
+	if len(b) >= 4 {
+		ln := int(binary.BigEndian.Uint32(b[0:4]))
+		if ln >= 0 && ln == len(b)-4 {
+			return b[4:], "int32"
+		}
+	}
+
+	// Check compact (uvarint length of len+1)
+	if uval, n := kbin.Uvarint(b); n > 0 {
+		if int(uval) >= 1 {
+			ln := int(uval) - 1
+			if ln >= 0 && n+ln == len(b) {
+				return b[n:], "compact"
+			}
+		}
+	}
+
+	// Check int16 BE
+	if len(b) >= 2 {
+		ln := int(binary.BigEndian.Uint16(b[0:2]))
+		if ln >= 0 && ln == len(b)-2 {
+			return b[2:], "int16"
+		}
+	}
+
+	return b, ""
 }
 
 // validatePlain validates PLAIN SASL credentials
