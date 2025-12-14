@@ -15,13 +15,10 @@ import (
 	"hash"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"strings"
 
 	"github.com/Jeffail/shutdown"
 	"github.com/golang/snappy"
@@ -615,8 +612,8 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 	case kmsg.SASLHandshake:
 		isFlexible = false // SASL Handshake is never flexible
 	case kmsg.SASLAuthenticate:
-		// SASLAuthenticate v2+ has flexible request body but uses non-flexible header (v1)
-		isFlexible = false
+		// SASLAuthenticate v2+ uses flexible header format
+		isFlexible = apiVersion >= 2
 	}
 
 	// Parse clientID from request header
@@ -768,95 +765,20 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 	req.SetVersion(apiVersion)
 	resp := req.ResponseKind().(*kmsg.SASLAuthenticateResponse)
 
-	// Parse the SASLAuthenticate request body using kmsg's ReadFrom from the body slice
-	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: incoming body len=%d, apiVersion=%d, content %x", connID, len(data), apiVersion, data[:min(len(data), 80)])
-	fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d handleSaslAuthenticate body len=%d apiVersion=%d hex:%x\n", connID, len(data), apiVersion, data[:min(len(data), 200)])
-	// This handles different API versions (including flexible v2 body formats) correctly
+	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: incoming body len=%d, apiVersion=%d", connID, len(data), apiVersion)
 
-	// Robustly parse auth bytes. Different clients and API versions may encode this
-	// field as Int32-length BYTES, CompactBytes (uvarint length), or in some cases
-	// legacy int16 length. Try the common encodings in order and fall back when
-	// necessary.
+	// Parse auth bytes based on API version:
+	// - v0, v1: AuthBytes is BYTES (Int32 length-prefixed)
+	// - v2: AuthBytes is COMPACT_BYTES (uvarint len+1)
+	b := kbin.Reader{Src: data}
 	var authBytes []byte
-	// Try Int32 BYTES (big-endian) first if enough length to read int32
-	if len(data) >= 4 {
-		ln := int(binary.BigEndian.Uint32(data[0:4]))
-		if ln >= 0 && ln <= len(data)-4 {
-			authBytes = data[4 : 4+ln]
-			k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Int32 BYTES (len=%d)", connID, ln)
-		}
-	}
-
-	// If Int32 parse failed, try compact bytes (uvarint length - 1)
-	if authBytes == nil {
-		if uval, n := kbin.Uvarint(data); n > 0 {
-			ln := int(uval) - 1
-			if ln >= 0 && n+ln <= len(data) {
-				authBytes = data[n : n+ln]
-				k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as CompactBytes (len=%d)", connID, ln)
-			}
-		}
-	}
-
-	// If still nil, try int16 (some clients historically used int16 length)
-	if authBytes == nil && len(data) >= 2 {
-		ln := int(binary.BigEndian.Uint16(data[0:2]))
-		if ln >= 0 && ln <= len(data)-2 {
-			authBytes = data[2 : 2+ln]
-			k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Int16 (len=%d)", connID, ln)
-		}
-	}
-
-	// As a last resort, attempt to use the kbin.Reader helper (Bytes)
-	if authBytes == nil {
-		b := kbin.Reader{Src: data}
+	if apiVersion >= 2 {
+		authBytes = b.CompactBytes()
+		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as CompactBytes (len=%d)", connID, len(authBytes))
+	} else {
 		authBytes = b.Bytes()
-		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as fallback Bytes() (len=%d)", connID, len(authBytes))
+		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Bytes (len=%d)", connID, len(authBytes))
 	}
-
-	// Before heuristics, strip a possible inner length-prefix if present.
-	// Some clients accidentally embed an inner length encoding inside the
-	// BYTES/Compact field; detect and remove it deterministically.
-	if stripped, kind := stripInnerLengthPrefix(authBytes); kind != "" {
-		k.logger.Debugf("[conn:%d] Stripped inner %s prefix from SASL auth bytes (len before=%d, after=%d)", connID, kind, len(authBytes), len(stripped))
-		authBytes = stripped
-	}
-
-	// Heuristics: validate parsed authBytes appear to be a SCRAM message
-	// for the expected step; if not, attempt alternative parses. This
-	// handles clients that use variable encodings across API versions.
-	isClientFirst := connState.scramConversation == nil
-	if !looksLikeScramPayload(authBytes, isClientFirst) {
-		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes didn't look like SCRAM payload, trying alternate parses", connID)
-		// Try other parses in order
-		tried := map[string]bool{"int32": authBytes != nil}
-		// try compact
-		if !tried["compact"] && len(data) > 0 {
-			if uval, n := kbin.Uvarint(data); n > 0 {
-				ln := int(uval) - 1
-				if ln >= 0 && n+ln <= len(data) {
-					alt := data[n : n+ln]
-					if looksLikeScramPayload(alt, isClientFirst) {
-						authBytes = alt
-					}
-				}
-			}
-		}
-		// try int16
-		if !looksLikeScramPayload(authBytes, isClientFirst) && len(data) >= 2 {
-			ln := int(binary.BigEndian.Uint16(data[0:2]))
-			if ln >= 0 && ln <= len(data)-2 {
-				alt := data[2 : 2+ln]
-				if looksLikeScramPayload(alt, isClientFirst) {
-					authBytes = alt
-				}
-			}
-		}
-	}
-	// Trim any trailing NUL bytes that may be present due to client encoding quirks.
-	// Some clients/implementations pad or include null bytes; removing them enables
-	// compatibility with different client libraries.
-	authBytes = bytes.TrimRight(authBytes, "\x00")
 
 	var authenticated bool
 
@@ -902,57 +824,30 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 
 // handleSCRAMAuth handles SCRAM challenge-response authentication
 func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
-	// Strip any inner length prefixes (int32/compact/int16) if present. Some
-	// clients send an extra length prefix inside the SASL payload; remove it
-	// deterministically rather than heuristically trimming control bytes.
-	if stripped, kind := stripInnerLengthPrefix(authBytes); kind != "" {
-		k.logger.Debugf("[conn:%d] Stripped inner %s prefix in SCRAM auth (len before=%d, after=%d)", connID, kind, len(authBytes), len(stripped))
-		authBytes = stripped
-	}
-
-	// Some clients (especially with compact encodings) may send a single
-	// leading control byte (0x00 or 0x01) before the SCRAM message. If
-	// removing a single leading byte results in something that looks like a
-	// SCRAM payload, strip that single byte. This preserves correctness
-	// without aggressively trimming arbitrary control bytes.
-	isClientFirst := connState.scramConversation == nil
-	if len(authBytes) > 1 && (authBytes[0] == 0x00 || authBytes[0] == 0x01) {
-		if looksLikeScramPayload(authBytes[1:], isClientFirst) {
-			k.logger.Debugf("[conn:%d] Stripping single leading control byte 0x%02x from SCRAM auth", connID, authBytes[0])
-			authBytes = authBytes[1:]
-		}
-	}
 	clientMessage := string(authBytes)
 
 	// If this is the first message (no conversation yet), create one
 	if connState.scramConversation == nil {
-		k.logger.Infof("[conn:%d] SCRAM Step 1: Starting new SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
-		k.logger.Infof("[conn:%d] SCRAM Step 1: Client first message (len=%d): %s", connID, len(clientMessage), clientMessage)
+		k.logger.Debugf("[conn:%d] Starting SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
 
 		// Create credential lookup function
 		var credLookup scram.CredentialLookup
 		if connState.scramMechanism == "SCRAM-SHA-256" {
 			credLookup = func(username string) (scram.StoredCredentials, error) {
-				k.logger.Infof("[conn:%d] SCRAM credential lookup for user: %s", connID, username)
 				creds, ok := k.scramSHA256[username]
 				if !ok {
 					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
 					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
 				}
-				k.logger.Infof("[conn:%d] Found credentials for user: %s (StoredKey len=%d, ServerKey len=%d)",
-					connID, username, len(creds.StoredKey), len(creds.ServerKey))
 				return creds, nil
 			}
 		} else if connState.scramMechanism == "SCRAM-SHA-512" {
 			credLookup = func(username string) (scram.StoredCredentials, error) {
-				k.logger.Infof("[conn:%d] SCRAM credential lookup for user: %s", connID, username)
 				creds, ok := k.scramSHA512[username]
 				if !ok {
 					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
 					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
 				}
-				k.logger.Infof("[conn:%d] Found credentials for user: %s (StoredKey len=%d, ServerKey len=%d)",
-					connID, username, len(creds.StoredKey), len(creds.ServerKey))
 				return creds, nil
 			}
 		} else {
@@ -975,117 +870,31 @@ func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, conn
 
 		// Start new conversation
 		connState.scramConversation = scramServer.NewConversation()
-		k.logger.Infof("[conn:%d] Created SCRAM conversation", connID)
-	} else {
-		k.logger.Infof("[conn:%d] SCRAM Step 2: Processing client final message (len=%d): %s", connID, len(clientMessage), clientMessage)
 	}
 
 	// Process the client message
-	k.logger.Infof("[conn:%d] Calling conversation.Step with message: %s", connID, clientMessage)
-	k.logger.Infof("[conn:%d] Client message hex: %x", connID, authBytes)
-	clientTokens := strings.Split(clientMessage, ",")
-	for i, t := range clientTokens {
-		k.logger.Infof("[conn:%d] Client token %d: %q (hex: %x)", connID, i, t, []byte(t))
-		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Client token %d: %q (hex: %x)\n", connID, i, t, []byte(t))
-	}
 	serverMessage, err := connState.scramConversation.Step(clientMessage)
 	if err != nil {
 		k.logger.Errorf("[conn:%d] SCRAM conversation step failed: %v", connID, err)
 		return false, fmt.Errorf("authentication failed: %w", err)
-	}
-	// Remove any NUL characters from server message for compatibility with clients
-	if strings.Contains(serverMessage, "\x00") {
-		serverMessage = strings.ReplaceAll(serverMessage, "\x00", "")
-	}
-	k.logger.Infof("[conn:%d] Server response (len=%d): %s", connID, len(serverMessage), serverMessage)
-	k.logger.Infof("[conn:%d] Server response hex: %x", connID, []byte(serverMessage))
-	// Debug: split server message into tokens and print their ASCII and hex forms
-	tokens := strings.Split(serverMessage, ",")
-	for i, t := range tokens {
-		k.logger.Infof("[conn:%d] Server token %d: %q (hex: %x)", connID, i, t, []byte(t))
-		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Server token %d: %q (hex: %x)\n", connID, i, t, []byte(t))
-	}
-
-	// Log byte 44 specifically if the message is long enough
-	if len(serverMessage) > 44 {
-		k.logger.Infof("[conn:%d] Byte 44 of server response: 0x%02x ('%c')", connID, serverMessage[44], serverMessage[44])
-		upper := min(51, len(serverMessage))
-		k.logger.Infof("[conn:%d] Bytes 40-50: %q hex:%x", connID, serverMessage[40:upper], serverMessage[40:upper])
 	}
 
 	// Set server response
 	resp.SASLAuthBytes = []byte(serverMessage)
 	resp.ErrorCode = 0
 
-	k.logger.Infof("[conn:%d] About to send response, SASLAuthBytes len=%d: %q", connID, len(resp.SASLAuthBytes), string(resp.SASLAuthBytes))
-	fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d About to send response, SASLAuthBytes len=%d: %q\n", connID, len(resp.SASLAuthBytes), string(resp.SASLAuthBytes))
-
 	// Check if conversation is complete
 	if connState.scramConversation.Done() {
-		k.logger.Infof("[conn:%d] SCRAM conversation is DONE, checking validity...", connID)
 		if connState.scramConversation.Valid() {
-			k.logger.Infof("[conn:%d] SCRAM authentication SUCCEEDED", connID)
+			k.logger.Debugf("[conn:%d] SCRAM authentication succeeded", connID)
 			return true, nil
-		} else {
-			k.logger.Warnf("[conn:%d] SCRAM authentication FAILED: invalid credentials", connID)
-			return false, fmt.Errorf("invalid credentials")
 		}
+		k.logger.Warnf("[conn:%d] SCRAM authentication failed: invalid credentials", connID)
+		return false, fmt.Errorf("invalid credentials")
 	}
 
 	// Conversation continues (need more steps)
-	k.logger.Infof("[conn:%d] SCRAM conversation continues (not done yet)", connID)
 	return false, nil
-}
-
-// looksLikeScramPayload checks basic characteristics of auth bytes to ensure
-// they represent the expected SCRAM client-first or client-final message.
-func looksLikeScramPayload(b []byte, isClientFirst bool) bool {
-	if len(b) == 0 {
-		return false
-	}
-	s := string(b)
-	if isClientFirst {
-		// Expect 'n,' or 'n,,n=' patterns
-		return strings.HasPrefix(s, "n,,") || strings.Contains(s, "n=") && strings.Contains(s, "r=")
-	}
-	// client-final expects c=, r= and p=
-	return strings.Contains(s, "c=") && strings.Contains(s, "r=") && strings.Contains(s, "p=")
-}
-
-// stripInnerLengthPrefix detects and removes an inner length-prefix if the
-// payload contains an embedded length encoding (Int32 BYTES, CompactBytes
-// (uvarint len+1), or Int16) where the decoded length exactly matches the
-// remaining payload. Returns the possibly-stripped slice and a string
-// describing the prefix that was removed ("int32", "compact", "int16")
-// or empty string when no inner prefix was removed.
-func stripInnerLengthPrefix(b []byte) ([]byte, string) {
-	// Check int32 BE
-	if len(b) >= 4 {
-		ln := int(binary.BigEndian.Uint32(b[0:4]))
-		if ln >= 0 && ln == len(b)-4 {
-			return b[4:], "int32"
-		}
-	}
-
-	// Check compact (uvarint length of len+1)
-	if uval, n := kbin.Uvarint(b); n > 0 {
-		if int(uval) >= 1 {
-			ln := int(uval) - 1
-			if ln >= 0 && n+ln == len(b) {
-				return b[n:], "compact"
-			}
-		}
-	}
-
-	// Check int16 BE
-	if len(b) >= 2 {
-		ln := int(binary.BigEndian.Uint16(b[0:2]))
-		if ln >= 0 && ln == len(b)-2 {
-			return b[2:], "int16"
-		}
-	}
-
-	return b, ""
 }
 
 // validatePlain validates PLAIN SASL credentials
@@ -1563,16 +1372,6 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, connID uint64, correlatio
 
 	k.logger.Debugf("[conn:%d] Sending response: correlationID=%d, flexible=%v, key=%d, total_size=%d, body_size=%d", connID, correlationID, msg.IsFlexible(), msg.Key(), len(buf), len(buf)-bufBeforeAppend)
 
-	// Log the response body for SASLAuthenticate
-	if msg.Key() == int16(kmsg.SASLAuthenticate) {
-		bodyHexLen := len(buf) - bufBeforeAppend
-		if bodyHexLen > 100 {
-			bodyHexLen = 100
-		}
-		k.logger.Infof("[conn:%d] SASLAuthenticate response body (first %d bytes): %x", connID, bodyHexLen, buf[bufBeforeAppend:bufBeforeAppend+bodyHexLen])
-		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d SASLAuthenticate response body (first %d bytes): %x\n", connID, bodyHexLen, buf[bufBeforeAppend:bufBeforeAppend+bodyHexLen])
-		fmt.Fprintf(os.Stderr, "[DEBUG-SCRAM] conn:%d Full buffer hex: %x\n", connID, buf)
-	}
 
 	return k.writeResponse(connID, conn, buf)
 }
