@@ -449,7 +449,7 @@ address: "127.0.0.1:19096"
 func makeSCRAMTestServer(t *testing.T, username, password string) *kafkaServerInput {
 	k := &kafkaServerInput{
 		logger:         service.MockResources().Logger(),
-		scramSHA256:    make(map[string]xdgscram.StoredCredentials),
+		saslSCRAM256Credentials:    make(map[string]xdgscram.StoredCredentials),
 		saslMechanisms: []string{"SCRAM-SHA-256"},
 		saslEnabled:    true,
 		timeout:        5 * time.Second,
@@ -458,7 +458,7 @@ func makeSCRAMTestServer(t *testing.T, username, password string) *kafkaServerIn
 	if err != nil {
 		t.Fatalf("failed to create scram credentials: %v", err)
 	}
-	k.scramSHA256[username] = creds
+	k.saslSCRAM256Credentials[username] = creds
 	return k
 }
 

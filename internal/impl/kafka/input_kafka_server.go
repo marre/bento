@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -70,14 +71,11 @@ const (
 
 	// maxClientIDLength is the maximum allowed client ID length to prevent DoS attacks
 	maxClientIDLength = 10000
-)
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+	// SCRAM authentication constants
+	scramSaltSize   = 16   // Size of random salt for SCRAM credentials
+	scramIterations = 4096 // PBKDF2 iterations (standard for SCRAM)
+)
 
 func kafkaServerInputConfig() *service.ConfigSpec {
 	return service.NewConfigSpec().
@@ -194,9 +192,9 @@ type kafkaServerInput struct {
 	tlsConfig       *tls.Config
 	saslEnabled     bool
 	saslMechanisms  []string                           // List of enabled SASL mechanisms (in order)
-	saslUsers       map[string]string                  // username -> password (for PLAIN)
-	scramSHA256     map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-256)
-	scramSHA512     map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-512)
+	saslPlainCredentials   map[string]string                  // username -> password (for PLAIN)
+	saslSCRAM256Credentials map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-256)
+	saslSCRAM512Credentials map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-512)
 	timeout         time.Duration
 	maxMessageBytes int
 
@@ -212,6 +210,7 @@ type kafkaServerInput struct {
 	shutdownOnce sync.Once
 	shutdownDone atomic.Bool
 	chanMu       sync.RWMutex // Protects msgChan access
+	connectMu    sync.Mutex   // Protects Connect() from concurrent calls
 
 	// Connection tracking for structured logging
 	connCounter atomic.Uint64 // Generates unique connection IDs
@@ -226,14 +225,11 @@ type messageBatch struct {
 // generateSCRAMCredentials generates SCRAM stored credentials from a plaintext password.
 // This manually generates StoredKey and ServerKey following RFC 5802, compatible with Kafka.
 func generateSCRAMCredentials(mechanism, username, password string) (scram.StoredCredentials, error) {
-	// Generate a random 16-byte salt
-	salt := make([]byte, 16)
+	// Generate a random salt
+	salt := make([]byte, scramSaltSize)
 	if _, err := rand.Read(salt); err != nil {
 		return scram.StoredCredentials{}, fmt.Errorf("failed to generate salt: %w", err)
 	}
-
-	// Use 4096 iterations (standard for SCRAM)
-	iterations := 4096
 
 	// Determine hash function based on mechanism
 	var hashFunc func() hash.Hash
@@ -251,7 +247,7 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 
 	// Derive SaltedPassword using PBKDF2
 	// SaltedPassword = PBKDF2(password, salt, iterations, keyLen)
-	saltedPassword := pbkdf2.Key([]byte(password), salt, iterations, keyLen, hashFunc)
+	saltedPassword := pbkdf2.Key([]byte(password), salt, scramIterations, keyLen, hashFunc)
 
 	// Compute ClientKey = HMAC(SaltedPassword, "Client Key")
 	clientKeyHMAC := hmac.New(hashFunc, saltedPassword)
@@ -275,7 +271,7 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 	return scram.StoredCredentials{
 		KeyFactors: scram.KeyFactors{
 			Salt:  string(salt),
-			Iters: iterations,
+			Iters: scramIterations,
 		},
 		StoredKey: storedKey,
 		ServerKey: serverKey,
@@ -320,9 +316,9 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 			return nil, fmt.Errorf("failed to parse SASL config: %w", err)
 		}
 
-		k.saslUsers = make(map[string]string)
-		k.scramSHA256 = make(map[string]scram.StoredCredentials)
-		k.scramSHA512 = make(map[string]scram.StoredCredentials)
+		k.saslPlainCredentials = make(map[string]string)
+		k.saslSCRAM256Credentials = make(map[string]scram.StoredCredentials)
+		k.saslSCRAM512Credentials = make(map[string]scram.StoredCredentials)
 		mechanismSet := make(map[string]bool)
 
 		for i, saslConf := range saslList {
@@ -356,21 +352,21 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 			// Store credentials based on mechanism
 			switch mechanism {
 			case "PLAIN":
-				k.saslUsers[username] = password
+				k.saslPlainCredentials[username] = password
 				k.logger.Infof("Registered SASL PLAIN user: %s", username)
 			case "SCRAM-SHA-256":
 				creds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
 				if err != nil {
 					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-256 credentials: %w", i, err)
 				}
-				k.scramSHA256[username] = creds
+				k.saslSCRAM256Credentials[username] = creds
 				k.logger.Infof("Registered SASL SCRAM-SHA-256 user: %s", username)
 			case "SCRAM-SHA-512":
 				creds, err := generateSCRAMCredentials("SCRAM-SHA-512", username, password)
 				if err != nil {
 					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-512 credentials: %w", i, err)
 				}
-				k.scramSHA512[username] = creds
+				k.saslSCRAM512Credentials[username] = creds
 				k.logger.Infof("Registered SASL SCRAM-SHA-512 user: %s", username)
 			}
 
@@ -409,6 +405,9 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 //------------------------------------------------------------------------------
 
 func (k *kafkaServerInput) Connect(ctx context.Context) error {
+	k.connectMu.Lock()
+	defer k.connectMu.Unlock()
+
 	if k.listener != nil {
 		return nil
 	}
@@ -782,6 +781,15 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 
 	var authenticated bool
 
+	// Check if mechanism was set during handshake
+	if connState.scramMechanism == "" {
+		k.logger.Errorf("[conn:%d] SASLAuthenticate received without prior handshake", connID)
+		resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
+		errMsg := "SASL handshake required before authentication"
+		resp.ErrorMessage = &errMsg
+		return false, k.sendResponse(conn, connID, correlationID, resp)
+	}
+
 	// Handle authentication based on mechanism
 	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: mechanism=%s, authBytes len=%d", connID, connState.scramMechanism, len(authBytes))
 	switch connState.scramMechanism {
@@ -822,6 +830,25 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 	return authenticated, sendErr
 }
 
+// getCredentialLookup returns a credential lookup function for the specified SCRAM mechanism.
+func (k *kafkaServerInput) getCredentialLookup(connID uint64, mechanism string) (scram.CredentialLookup, map[string]scram.StoredCredentials) {
+	var credsMap map[string]scram.StoredCredentials
+	if mechanism == "SCRAM-SHA-512" {
+		credsMap = k.saslSCRAM512Credentials
+	} else {
+		credsMap = k.saslSCRAM256Credentials
+	}
+
+	return func(username string) (scram.StoredCredentials, error) {
+		creds, ok := credsMap[username]
+		if !ok {
+			k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
+			return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
+		}
+		return creds, nil
+	}, credsMap
+}
+
 // handleSCRAMAuth handles SCRAM challenge-response authentication
 func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
 	clientMessage := string(authBytes)
@@ -830,37 +857,17 @@ func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, conn
 	if connState.scramConversation == nil {
 		k.logger.Debugf("[conn:%d] Starting SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
 
-		// Create credential lookup function
-		var credLookup scram.CredentialLookup
-		if connState.scramMechanism == "SCRAM-SHA-256" {
-			credLookup = func(username string) (scram.StoredCredentials, error) {
-				creds, ok := k.scramSHA256[username]
-				if !ok {
-					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
-					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
-				}
-				return creds, nil
-			}
-		} else if connState.scramMechanism == "SCRAM-SHA-512" {
-			credLookup = func(username string) (scram.StoredCredentials, error) {
-				creds, ok := k.scramSHA512[username]
-				if !ok {
-					k.logger.Warnf("[conn:%d] User not found: %s", connID, username)
-					return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
-				}
-				return creds, nil
-			}
-		} else {
-			return false, fmt.Errorf("unsupported SCRAM mechanism: %s", connState.scramMechanism)
-		}
+		credLookup, _ := k.getCredentialLookup(connID, connState.scramMechanism)
 
 		// Create SCRAM server based on mechanism
 		var scramServer *scram.Server
 		var err error
 		if connState.scramMechanism == "SCRAM-SHA-256" {
 			scramServer, err = scram.SHA256.NewServer(credLookup)
-		} else {
+		} else if connState.scramMechanism == "SCRAM-SHA-512" {
 			scramServer, err = scram.SHA512.NewServer(credLookup)
+		} else {
+			return false, fmt.Errorf("unsupported SCRAM mechanism: %s", connState.scramMechanism)
 		}
 
 		if err != nil {
@@ -916,13 +923,14 @@ func (k *kafkaServerInput) validatePlain(connID uint64, authBytes []byte) bool {
 
 	k.logger.Debugf("[conn:%d] Validating credentials for username: %s", connID, username)
 
-	expectedPassword, exists := k.saslUsers[username]
+	expectedPassword, exists := k.saslPlainCredentials[username]
 	if !exists {
 		k.logger.Debugf("[conn:%d] User not found: %s", connID, username)
 		return false
 	}
 
-	if expectedPassword != password {
+	// Use constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(password)) != 1 {
 		k.logger.Debugf("[conn:%d] Password mismatch for user: %s", connID, username)
 		return false
 	}
@@ -1053,8 +1061,29 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, connID uint64, corre
 	return k.sendResponse(conn, connID, correlationID, resp)
 }
 
-func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remoteAddr string, correlationID int32, req *kmsg.ProduceRequest, resp *kmsg.ProduceResponse) error {
+// buildProduceResponseTopics constructs response topics for all topics/partitions in a produce request.
+func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int16) []kmsg.ProduceResponseTopic {
+	result := make([]kmsg.ProduceResponseTopic, 0, len(topics))
+	for _, topic := range topics {
+		respTopic := kmsg.ProduceResponseTopic{
+			Topic:      topic.Topic,
+			Partitions: make([]kmsg.ProduceResponseTopicPartition, 0, len(topic.Partitions)),
+		}
+		for _, partition := range topic.Partitions {
+			respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
+				Partition:      partition.Partition,
+				ErrorCode:      errorCode,
+				BaseOffset:     0,
+				LogAppendTime:  -1,
+				LogStartOffset: 0,
+			})
+		}
+		result = append(result, respTopic)
+	}
+	return result
+}
 
+func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remoteAddr string, correlationID int32, req *kmsg.ProduceRequest, resp *kmsg.ProduceResponse) error {
 	k.logger.Infof("[conn:%d] Produce request: correlationID=%d, acks=%d, topics=%d", connID, correlationID, req.Acks, len(req.Topics))
 
 	var batch service.MessageBatch
@@ -1108,22 +1137,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	// If no messages, still need to build response for all requested topics/partitions
 	if len(batch) == 0 {
 		k.logger.Debugf("[conn:%d] No messages to process, building success response", connID)
-		// Build response for all topics/partitions that were in the request
-		for _, topic := range req.Topics {
-			respTopic := kmsg.ProduceResponseTopic{
-				Topic: topic.Topic,
-			}
-			for _, partition := range topic.Partitions {
-				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-					Partition:      partition.Partition,
-					ErrorCode:      0, // Success
-					BaseOffset:     0,
-					LogAppendTime:  -1,
-					LogStartOffset: 0,
-				})
-			}
-			resp.Topics = append(resp.Topics, respTopic)
-		}
+		resp.Topics = buildProduceResponseTopics(req.Topics, 0)
 		return k.sendResponse(conn, connID, correlationID, resp)
 	}
 
@@ -1147,19 +1161,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		k.logger.Debugf("[conn:%d] Successfully sent batch to pipeline", connID)
 	case <-time.After(k.timeout):
 		k.logger.Warnf("[conn:%d] Timeout sending batch to pipeline", connID)
-		// Build timeout error response for all topics/partitions
-		for _, topic := range req.Topics {
-			respTopic := kmsg.ProduceResponseTopic{
-				Topic: topic.Topic,
-			}
-			for _, partition := range topic.Partitions {
-				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-					Partition: partition.Partition,
-					ErrorCode: kerr.RequestTimedOut.Code,
-				})
-			}
-			resp.Topics = append(resp.Topics, respTopic)
-		}
+		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
 		return k.sendResponse(conn, connID, correlationID, resp)
 	case <-k.shutdownCh:
 		return fmt.Errorf("shutting down")
@@ -1171,61 +1173,20 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		k.logger.Debugf("[conn:%d] Waiting for acknowledgment (acks != 0)", connID)
 		select {
 		case err := <-resChan:
-			// Build response for all topics/partitions that were in the request
-			for _, topic := range req.Topics {
-				respTopic := kmsg.ProduceResponseTopic{
-					Topic: topic.Topic,
-				}
-				for _, partition := range topic.Partitions {
-					errorCode := int16(0)
-					if err != nil {
-						errorCode = kerr.UnknownServerError.Code
-					}
-					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-						Partition:      partition.Partition,
-						ErrorCode:      errorCode,
-						BaseOffset:     0,  // Starting offset
-						LogAppendTime:  -1, // -1 means CreateTime is used
-						LogStartOffset: 0,  // Earliest offset in partition
-					})
-				}
-				resp.Topics = append(resp.Topics, respTopic)
+			errorCode := int16(0)
+			if err != nil {
+				errorCode = kerr.UnknownServerError.Code
 			}
+			resp.Topics = buildProduceResponseTopics(req.Topics, errorCode)
 		case <-time.After(k.timeout):
-			// Build timeout error response for all topics/partitions
-			for _, topic := range req.Topics {
-				respTopic := kmsg.ProduceResponseTopic{
-					Topic: topic.Topic,
-				}
-				for _, partition := range topic.Partitions {
-					respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-						Partition: partition.Partition,
-						ErrorCode: kerr.RequestTimedOut.Code,
-					})
-				}
-				resp.Topics = append(resp.Topics, respTopic)
-			}
+			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
 		case <-k.shutdownCh:
 			return fmt.Errorf("shutting down")
 		}
 	} else {
 		// When acks=0, don't wait for acknowledgment but still build response
 		k.logger.Debugf("[conn:%d] acks=0, sending immediate success response", connID)
-		for _, topic := range req.Topics {
-			respTopic := kmsg.ProduceResponseTopic{
-				Topic: topic.Topic,
-			}
-			for _, partition := range topic.Partitions {
-				respTopic.Partitions = append(respTopic.Partitions, kmsg.ProduceResponseTopicPartition{
-					Partition:      partition.Partition,
-					ErrorCode:      0, // Success
-					BaseOffset:     0,
-					LogAppendTime:  -1,
-					LogStartOffset: 0,
-				})
-			}
-			resp.Topics = append(resp.Topics, respTopic)
-		}
+		resp.Topics = buildProduceResponseTopics(req.Topics, 0)
 	}
 
 	return k.sendResponse(conn, connID, correlationID, resp)
@@ -1371,7 +1332,6 @@ func (k *kafkaServerInput) sendResponse(conn net.Conn, connID uint64, correlatio
 	buf = msg.AppendTo(buf)
 
 	k.logger.Debugf("[conn:%d] Sending response: correlationID=%d, flexible=%v, key=%d, total_size=%d, body_size=%d", connID, correlationID, msg.IsFlexible(), msg.Key(), len(buf), len(buf)-bufBeforeAppend)
-
 
 	return k.writeResponse(connID, conn, buf)
 }
