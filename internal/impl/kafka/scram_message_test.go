@@ -13,7 +13,7 @@ func TestSCRAMMessageFormat(t *testing.T) {
 	password := "scrampass"
 
 	// Generate server credentials
-	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", password)
 	if err != nil {
 		t.Fatalf("Failed to generate credentials: %v", err)
 	}

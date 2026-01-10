@@ -16,7 +16,7 @@ func TestSCRAMCredentialGeneration(t *testing.T) {
 	password := "testpass"
 
 	// Generate credentials using our function
-	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", password)
 	require.NoError(t, err)
 
 	t.Logf("Generated credentials: Salt len=%d, Iters=%d, StoredKey len=%d, ServerKey len=%d",
@@ -91,7 +91,7 @@ func TestSCRAMCredentialGenerationWrongPassword(t *testing.T) {
 	wrongPassword := "wrongpass"
 
 	// Generate server credentials with correct password
-	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, correctPassword)
+	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", correctPassword)
 	require.NoError(t, err)
 
 	credLookup := func(user string) (scram.StoredCredentials, error) {

@@ -448,13 +448,13 @@ address: "127.0.0.1:19096"
 // Helper that creates a kafkaServerInput with an SCRAM-SHA-256 user for tests.
 func makeSCRAMTestServer(t *testing.T, username, password string) *kafkaServerInput {
 	k := &kafkaServerInput{
-		logger:         service.MockResources().Logger(),
-		saslSCRAM256Credentials:    make(map[string]xdgscram.StoredCredentials),
-		saslMechanisms: []string{"SCRAM-SHA-256"},
-		saslEnabled:    true,
-		timeout:        5 * time.Second,
+		logger:                  service.MockResources().Logger(),
+		saslSCRAM256Credentials: make(map[string]xdgscram.StoredCredentials),
+		saslMechanisms:          []string{saslMechanismScramSha256},
+		saslEnabled:             true,
+		timeout:                 5 * time.Second,
 	}
-	creds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+	creds, err := generateSCRAMCredentials(saslMechanismScramSha256, password)
 	if err != nil {
 		t.Fatalf("failed to create scram credentials: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestHandleSaslAuthenticate_Int32Bytes_ParsingAndTrim(t *testing.T) {
 	defer sConn.Close()
 	defer cConn.Close()
 
-	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+	connState := &connectionState{scramMechanism: saslMechanismScramSha256}
 
 	done := make(chan error, 1)
 	go func() {
@@ -539,7 +539,7 @@ func TestHandleSaslAuthenticate_CompactBytes_Parsing(t *testing.T) {
 	defer sConn.Close()
 	defer cConn.Close()
 
-	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+	connState := &connectionState{scramMechanism: saslMechanismScramSha256}
 
 	done := make(chan error, 1)
 	go func() {
@@ -585,7 +585,7 @@ func TestHandleSaslAuthenticate_CompactBytes_Parsing(t *testing.T) {
 // by handleSCRAMAuth before processing.
 func TestHandleSCRAMAuth_TrimsLeadingControlBytes(t *testing.T) {
 	k := makeSCRAMTestServer(t, "scramuser", "password")
-	connState := &connectionState{scramMechanism: "SCRAM-SHA-256"}
+	connState := &connectionState{scramMechanism: saslMechanismScramSha256}
 
 	// Construct a client-first message with a leading 0x01 control byte
 	payload := append([]byte{0x01}, []byte("n,,n=scramuser,r=nonce_lead")...)
@@ -1359,4 +1359,51 @@ sasl:
 	// Should get an authentication error
 	assert.Error(t, results[0].Err)
 	t.Logf("Expected SCRAM authentication error received: %v", results[0].Err)
+}
+
+// TestParseRequestHeader tests the parseRequestHeader function.
+func TestParseRequestHeader(t *testing.T) {
+	t.Run("non-flexible request", func(t *testing.T) {
+		var buf []byte
+		buf = kbin.AppendInt16(buf, int16(kmsg.Metadata)) // apiKey
+		buf = kbin.AppendInt16(buf, 8)                    // apiVersion (non-flexible)
+		buf = kbin.AppendInt32(buf, 12345)                // correlationID
+		buf = kbin.AppendInt16(buf, 4)                    // clientID length
+		buf = append(buf, []byte("test")...)              // clientID
+		bodyMarker := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+		buf = append(buf, bodyMarker...)
+
+		hdr, err := parseRequestHeader(buf)
+		require.NoError(t, err)
+		assert.Equal(t, int16(kmsg.Metadata), hdr.apiKey)
+		assert.Equal(t, int16(8), hdr.apiVersion)
+		assert.Equal(t, int32(12345), hdr.correlationID)
+		assert.False(t, hdr.isFlexible)
+		assert.Equal(t, bodyMarker, buf[hdr.bodyOffset:hdr.bodyOffset+4])
+	})
+
+	t.Run("flexible request with tagged fields", func(t *testing.T) {
+		var buf []byte
+		buf = kbin.AppendInt16(buf, int16(kmsg.Produce)) // apiKey
+		buf = kbin.AppendInt16(buf, 9)                   // apiVersion (flexible)
+		buf = kbin.AppendInt32(buf, 99999)               // correlationID
+		buf = kbin.AppendInt16(buf, -1)                  // clientID (null)
+		buf = kbin.AppendUvarint(buf, 1)                 // 1 tag
+		buf = kbin.AppendUvarint(buf, 0)                 // tagID
+		buf = kbin.AppendUvarint(buf, 2)                 // tagSize
+		buf = append(buf, 0xAA, 0xBB)                    // tag data
+		bodyMarker := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+		buf = append(buf, bodyMarker...)
+
+		hdr, err := parseRequestHeader(buf)
+		require.NoError(t, err)
+		assert.Equal(t, int16(kmsg.Produce), hdr.apiKey)
+		assert.True(t, hdr.isFlexible)
+		assert.Equal(t, bodyMarker, buf[hdr.bodyOffset:hdr.bodyOffset+4])
+	})
+
+	t.Run("request too small", func(t *testing.T) {
+		_, err := parseRequestHeader([]byte{0x00, 0x01, 0x02})
+		assert.Error(t, err)
+	})
 }

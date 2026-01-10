@@ -17,7 +17,7 @@ func TestXDGSCRAMWithFranzClient(t *testing.T) {
 	password := "testpass"
 
 	// Generate credentials using our function
-	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", password)
 	require.NoError(t, err)
 
 	// Create xdg-go/scram server

@@ -77,6 +77,19 @@ const (
 	scramIterations = 4096 // PBKDF2 iterations (standard for SCRAM)
 )
 
+// SASL mechanism typed constants
+const (
+	saslMechanismPlain       = "PLAIN"
+	saslMechanismScramSha256 = "SCRAM-SHA-256"
+	saslMechanismScramSha512 = "SCRAM-SHA-512"
+)
+
+// SCRAM key derivation labels (RFC 5802)
+const (
+	scramClientKeyLabel = "Client Key"
+	scramServerKeyLabel = "Server Key"
+)
+
 func kafkaServerInputConfig() *service.ConfigSpec {
 	return service.NewConfigSpec().
 		Stable().
@@ -187,16 +200,16 @@ func init() {
 //------------------------------------------------------------------------------
 
 type kafkaServerInput struct {
-	address         string
-	allowedTopics   map[string]struct{}
-	tlsConfig       *tls.Config
-	saslEnabled     bool
-	saslMechanisms  []string                           // List of enabled SASL mechanisms (in order)
-	saslPlainCredentials   map[string]string                  // username -> password (for PLAIN)
+	address                 string
+	allowedTopics           map[string]struct{}
+	tlsConfig               *tls.Config
+	saslEnabled             bool
+	saslMechanisms          []string                           // List of enabled SASL mechanisms (in order)
+	saslPlainCredentials    map[string]string                  // username -> password (for PLAIN)
 	saslSCRAM256Credentials map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-256)
 	saslSCRAM512Credentials map[string]scram.StoredCredentials // username -> credentials (for SCRAM-SHA-512)
-	timeout         time.Duration
-	maxMessageBytes int
+	timeout                 time.Duration
+	maxMessageBytes         int
 
 	listener   net.Listener
 	msgChan    chan messageBatch
@@ -224,7 +237,8 @@ type messageBatch struct {
 
 // generateSCRAMCredentials generates SCRAM stored credentials from a plaintext password.
 // This manually generates StoredKey and ServerKey following RFC 5802, compatible with Kafka.
-func generateSCRAMCredentials(mechanism, username, password string) (scram.StoredCredentials, error) {
+// Note: username is not part of key derivation per RFC 5802 - it's only used to look up credentials.
+func generateSCRAMCredentials(mechanism, password string) (scram.StoredCredentials, error) {
 	// Generate a random salt
 	salt := make([]byte, scramSaltSize)
 	if _, err := rand.Read(salt); err != nil {
@@ -235,10 +249,10 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 	var hashFunc func() hash.Hash
 	var keyLen int
 	switch mechanism {
-	case "SCRAM-SHA-256":
+	case saslMechanismScramSha256:
 		hashFunc = sha256.New
 		keyLen = sha256.Size
-	case "SCRAM-SHA-512":
+	case saslMechanismScramSha512:
 		hashFunc = sha512.New
 		keyLen = sha512.Size
 	default:
@@ -251,7 +265,7 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 
 	// Compute ClientKey = HMAC(SaltedPassword, "Client Key")
 	clientKeyHMAC := hmac.New(hashFunc, saltedPassword)
-	clientKeyHMAC.Write([]byte("Client Key"))
+	clientKeyHMAC.Write([]byte(scramClientKeyLabel))
 	clientKey := clientKeyHMAC.Sum(nil)
 
 	// Compute StoredKey = Hash(ClientKey)
@@ -261,7 +275,7 @@ func generateSCRAMCredentials(mechanism, username, password string) (scram.Store
 
 	// Compute ServerKey = HMAC(SaltedPassword, "Server Key")
 	serverKeyHMAC := hmac.New(hashFunc, saltedPassword)
-	serverKeyHMAC.Write([]byte("Server Key"))
+	serverKeyHMAC.Write([]byte(scramServerKeyLabel))
 	serverKey := serverKeyHMAC.Sum(nil)
 
 	// Return credentials in xdg-go/scram format
@@ -322,19 +336,12 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 		mechanismSet := make(map[string]bool)
 
 		for i, saslConf := range saslList {
-			mechanism, err := saslConf.FieldString("mechanism")
+			mechanismStr, err := saslConf.FieldString("mechanism")
 			if err != nil {
 				return nil, fmt.Errorf("SASL config %d: %w", i, err)
 			}
 
-			// Validate mechanism
-			switch mechanism {
-			case "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512":
-				// Supported
-			default:
-				return nil, fmt.Errorf("SASL config %d: unsupported mechanism %q (supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)", i, mechanism)
-			}
-
+			// Validate mechanism string and store credentials accordingly
 			username, err := saslConf.FieldString("username")
 			if err != nil {
 				return nil, fmt.Errorf("SASL config %d: %w", i, err)
@@ -349,45 +356,46 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 				return nil, fmt.Errorf("SASL config %d: username cannot be empty", i)
 			}
 
-			// Store credentials based on mechanism
-			switch mechanism {
-			case "PLAIN":
+			switch mechanismStr {
+			case saslMechanismPlain:
 				k.saslPlainCredentials[username] = password
 				k.logger.Infof("Registered SASL PLAIN user: %s", username)
-			case "SCRAM-SHA-256":
-				creds, err := generateSCRAMCredentials("SCRAM-SHA-256", username, password)
+			case saslMechanismScramSha256:
+				creds, err := generateSCRAMCredentials(saslMechanismScramSha256, password)
 				if err != nil {
 					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-256 credentials: %w", i, err)
 				}
 				k.saslSCRAM256Credentials[username] = creds
 				k.logger.Infof("Registered SASL SCRAM-SHA-256 user: %s", username)
-			case "SCRAM-SHA-512":
-				creds, err := generateSCRAMCredentials("SCRAM-SHA-512", username, password)
+			case saslMechanismScramSha512:
+				creds, err := generateSCRAMCredentials(saslMechanismScramSha512, password)
 				if err != nil {
 					return nil, fmt.Errorf("SASL config %d: failed to generate SCRAM-SHA-512 credentials: %w", i, err)
 				}
 				k.saslSCRAM512Credentials[username] = creds
 				k.logger.Infof("Registered SASL SCRAM-SHA-512 user: %s", username)
+			default:
+				return nil, fmt.Errorf("SASL config %d: unsupported mechanism %q (supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)", i, mechanismStr)
 			}
 
 			// Track unique mechanisms
-			mechanismSet[mechanism] = true
+			mechanismSet[mechanismStr] = true
 		}
 
 		// Build list of enabled mechanisms in priority order (SCRAM preferred over PLAIN)
-		if mechanismSet["SCRAM-SHA-512"] {
-			k.saslMechanisms = append(k.saslMechanisms, "SCRAM-SHA-512")
+		if mechanismSet[saslMechanismScramSha512] {
+			k.saslMechanisms = append(k.saslMechanisms, saslMechanismScramSha512)
 		}
-		if mechanismSet["SCRAM-SHA-256"] {
-			k.saslMechanisms = append(k.saslMechanisms, "SCRAM-SHA-256")
+		if mechanismSet[saslMechanismScramSha256] {
+			k.saslMechanisms = append(k.saslMechanisms, saslMechanismScramSha256)
 		}
-		if mechanismSet["PLAIN"] {
-			k.saslMechanisms = append(k.saslMechanisms, "PLAIN")
+		if mechanismSet[saslMechanismPlain] {
+			k.saslMechanisms = append(k.saslMechanisms, saslMechanismPlain)
 		}
 
 		k.saslEnabled = len(k.saslMechanisms) > 0
 		if k.saslEnabled {
-			k.logger.Infof("SASL authentication enabled with mechanisms: %v", k.saslMechanisms)
+			k.logger.Infof("SASL authentication enabled with mechanisms: %v", append([]string{}, k.saslMechanisms...))
 		}
 	}
 
@@ -500,6 +508,20 @@ type connectionState struct {
 	scramMechanism    string                    // Which SCRAM mechanism is being used
 }
 
+// saslAuthenticator defines the interface for SASL authentication handlers.
+// This interface enables testing with mock authenticators.
+type saslAuthenticator interface {
+	// validatePlain validates PLAIN SASL credentials and returns true if valid.
+	validatePlain(connID uint64, authBytes []byte) bool
+	// handleSCRAMAuth handles SCRAM challenge-response authentication.
+	// Returns (authenticated, error) where authenticated is true only when
+	// the full SCRAM conversation completes successfully.
+	handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error)
+}
+
+// Compile-time check that kafkaServerInput implements saslAuthenticator.
+var _ saslAuthenticator = (*kafkaServerInput)(nil)
+
 func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 	// Generate unique connection ID for structured logging
 	connID := k.connCounter.Add(1)
@@ -572,148 +594,155 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 	}
 }
 
-func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAddr string, data []byte, connState *connectionState) (bool, error) {
-	// Parse request header using kmsg types
+// requestHeader contains parsed Kafka request header fields.
+type requestHeader struct {
+	apiKey        int16
+	apiVersion    int16
+	correlationID int32
+	isFlexible    bool
+	bodyOffset    int
+}
+
+// parseRequestHeader parses a Kafka request header and returns the header fields and body offset.
+func parseRequestHeader(data []byte) (requestHeader, error) {
 	if len(data) < 8 {
-		k.logger.Errorf("[conn:%d] Request too small: %d bytes", connID, len(data))
-		return false, fmt.Errorf("request too small: %d bytes", len(data))
+		return requestHeader{}, fmt.Errorf("request too small: %d bytes", len(data))
 	}
 
-	// Read header fields
 	b := kbin.Reader{Src: data}
-	apiKey := b.Int16()
-	apiVersion := b.Int16()
-	correlationID := b.Int32()
-
-	k.logger.Debugf("[conn:%d] Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", connID, apiKey, apiVersion, correlationID, len(data))
-
-	// Check if client needs authentication first (only if SASL is enabled)
-	if k.saslEnabled && !connState.authenticated {
-		// Only allow ApiVersions, SASLHandshake, and SASLAuthenticate before authentication
-		switch kmsg.Key(apiKey) {
-		case kmsg.ApiVersions, kmsg.SASLHandshake, kmsg.SASLAuthenticate:
-			// These are allowed before authentication
-		default:
-			k.logger.Warnf("[conn:%d] Rejecting unauthenticated request for API key %d", connID, apiKey)
-			return false, fmt.Errorf("authentication required")
-		}
+	hdr := requestHeader{
+		apiKey:        b.Int16(),
+		apiVersion:    b.Int16(),
+		correlationID: b.Int32(),
 	}
 
-	// Determine if flexible request (v3+ for ApiVersions, v9+ for others)
-	isFlexible := false
-	switch kmsg.Key(apiKey) {
+	// Determine if flexible request based on API key and version
+	switch kmsg.Key(hdr.apiKey) {
 	case kmsg.ApiVersions:
-		isFlexible = apiVersion >= 3
+		hdr.isFlexible = hdr.apiVersion >= 3
 	case kmsg.Metadata:
-		isFlexible = apiVersion >= 9
+		hdr.isFlexible = hdr.apiVersion >= 9
 	case kmsg.Produce:
-		isFlexible = apiVersion >= 9
+		hdr.isFlexible = hdr.apiVersion >= 9
 	case kmsg.SASLHandshake:
-		isFlexible = false // SASL Handshake is never flexible
+		hdr.isFlexible = false // SASL Handshake is never flexible
 	case kmsg.SASLAuthenticate:
-		// SASLAuthenticate v2+ uses flexible header format
-		isFlexible = apiVersion >= 2
+		hdr.isFlexible = hdr.apiVersion >= 2
 	}
-
-	// Parse clientID from request header
-	// The encoding depends on whether the request is flexible or not
-	// For flexible requests (v2+), clientID is COMPACT_STRING (uvarint length)
-	// For non-flexible requests, clientID is NULLABLE_STRING (int16 length)
 
 	// Read clientID (nullable string: int16 length, then data)
 	clientIDLen := b.Int16()
 	if clientIDLen > maxClientIDLength {
-		k.logger.Errorf("[conn:%d] Client ID too large: %d bytes (max: %d)", connID, clientIDLen, maxClientIDLength)
-		return false, fmt.Errorf("client ID too large: %d bytes", clientIDLen)
+		return requestHeader{}, fmt.Errorf("client ID too large: %d bytes", clientIDLen)
 	}
 	if clientIDLen > 0 {
 		b.Span(int(clientIDLen))
 	}
 
-	if isFlexible {
+	if hdr.isFlexible {
 		// Flexible header v2 has TAG_BUFFER (compact array of tagged fields)
 		tagCount := b.Uvarint()
 		for i := 0; i < int(tagCount); i++ {
-			tagID := b.Uvarint()
+			_ = b.Uvarint() // tagID (unused)
 			tagSize := b.Uvarint()
 			b.Span(int(tagSize))
-			_ = tagID // unused
 		}
 	}
 
-	// Now b is positioned at the start of the request body
-	offset := len(data) - len(b.Src)
+	hdr.bodyOffset = len(data) - len(b.Src)
+	return hdr, nil
+}
 
-	k.logger.Debugf("[conn:%d] Request body from offset %d (isFlexible=%v): %x", connID, offset, isFlexible, data[offset:min(offset+20, len(data))])
+func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAddr string, data []byte, connState *connectionState) (bool, error) {
+	hdr, err := parseRequestHeader(data)
+	if err != nil {
+		k.logger.Errorf("[conn:%d] Failed to parse request header: %v", connID, err)
+		return false, err
+	}
 
-	var err error
+	k.logger.Debugf("[conn:%d] Received request: apiKey=%d, apiVersion=%d, correlationID=%d, size=%d", connID, hdr.apiKey, hdr.apiVersion, hdr.correlationID, len(data))
+
+	// Check if client needs authentication first (only if SASL is enabled)
+	if k.saslEnabled && !connState.authenticated {
+		switch kmsg.Key(hdr.apiKey) {
+		case kmsg.ApiVersions, kmsg.SASLHandshake, kmsg.SASLAuthenticate:
+			// These are allowed before authentication
+		default:
+			k.logger.Warnf("[conn:%d] Rejecting unauthenticated request for API key %d", connID, hdr.apiKey)
+			return false, fmt.Errorf("authentication required")
+		}
+	}
+
+	k.logger.Debugf("[conn:%d] Request body from offset %d (isFlexible=%v): %x", connID, hdr.bodyOffset, hdr.isFlexible, data[hdr.bodyOffset:min(hdr.bodyOffset+20, len(data))])
+
+	var handleErr error
 	authUpdated := false
 
-	switch kmsg.Key(apiKey) {
+	switch kmsg.Key(hdr.apiKey) {
 	case kmsg.ApiVersions:
 		// ApiVersions request has minimal/no body
 		k.logger.Debugf("[conn:%d] Handling ApiVersions", connID)
 		resp := kmsg.NewApiVersionsResponse()
-		resp.SetVersion(apiVersion)
-		err = k.handleApiVersionsReq(conn, connID, correlationID, nil, &resp)
+		resp.SetVersion(hdr.apiVersion)
+		handleErr = k.handleApiVersionsReq(conn, connID, hdr.correlationID, nil, &resp)
 	case kmsg.SASLHandshake:
 		// Handle SASL handshake
 		k.logger.Debugf("[conn:%d] Handling SASLHandshake", connID)
-		err = k.handleSaslHandshake(conn, connID, correlationID, data[offset:], apiVersion, connState)
+		handleErr = k.handleSaslHandshake(conn, connID, hdr.correlationID, data[hdr.bodyOffset:], hdr.apiVersion, connState)
 	case kmsg.SASLAuthenticate:
 		// Handle SASL authentication
 		k.logger.Debugf("[conn:%d] Handling SASLAuthenticate", connID)
-		k.logger.Debugf("[conn:%d] SASLAuthenticate body offset=%d len=%d first bytes: %x", connID, offset, len(data[offset:]), data[offset:min(offset+40, len(data))])
+		k.logger.Debugf("[conn:%d] SASLAuthenticate body offset=%d len=%d first bytes: %x", connID, hdr.bodyOffset, len(data[hdr.bodyOffset:]), data[hdr.bodyOffset:min(hdr.bodyOffset+40, len(data))])
 		authSuccess := false
-		authSuccess, err = k.handleSaslAuthenticate(conn, connID, correlationID, data[offset:], apiVersion, connState)
-		if err == nil && authSuccess {
+		authSuccess, handleErr = k.handleSaslAuthenticate(conn, connID, hdr.correlationID, data[hdr.bodyOffset:], hdr.apiVersion, connState)
+		if handleErr == nil && authSuccess {
 			connState.authenticated = true
 			authUpdated = true
 		}
 	case kmsg.Metadata:
 		// Parse metadata request body (after header)
 		req := kmsg.NewMetadataRequest()
-		req.SetVersion(apiVersion)
+		req.SetVersion(hdr.apiVersion)
 		resp := kmsg.NewMetadataResponse()
-		resp.SetVersion(apiVersion)
+		resp.SetVersion(hdr.apiVersion)
 
-		parseErr := req.ReadFrom(data[offset:])
+		parseErr := req.ReadFrom(data[hdr.bodyOffset:])
 
 		if parseErr != nil {
 			k.logger.Errorf("[conn:%d] Failed to parse MetadataRequest: %v", connID, parseErr)
 			// Send empty response - can't properly signal error without knowing requested topics
 			// The connection will likely be closed by the client after this invalid request
-			err = k.sendResponse(conn, connID, correlationID, &resp)
+			handleErr = k.sendResponse(conn, connID, hdr.correlationID, &resp)
 		} else {
-			k.logger.Debugf("[conn:%d] ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d", connID, offset, len(req.Topics))
-			err = k.handleMetadataReq(conn, connID, correlationID, &req, &resp)
+			k.logger.Debugf("[conn:%d] ReadFrom SUCCEEDED for Metadata at offset=%d, topics count=%d", connID, hdr.bodyOffset, len(req.Topics))
+			handleErr = k.handleMetadataReq(conn, connID, hdr.correlationID, &req, &resp)
 		}
 	case kmsg.Produce:
 		// Parse produce request body (after header)
 		req := kmsg.NewProduceRequest()
-		req.SetVersion(apiVersion)
+		req.SetVersion(hdr.apiVersion)
 		resp := kmsg.NewProduceResponse()
-		resp.SetVersion(apiVersion)
-		k.logger.Debugf("[conn:%d] About to call ReadFrom for Produce, body size=%d (offset=%d)", connID, len(data[offset:]), offset)
+		resp.SetVersion(hdr.apiVersion)
+		k.logger.Debugf("[conn:%d] About to call ReadFrom for Produce, body size=%d (offset=%d)", connID, len(data[hdr.bodyOffset:]), hdr.bodyOffset)
 
-		parseErr := req.ReadFrom(data[offset:])
+		parseErr := req.ReadFrom(data[hdr.bodyOffset:])
 
 		if parseErr != nil {
 			k.logger.Errorf("[conn:%d] Failed to parse ProduceRequest: %v", connID, parseErr)
 			// Send empty response - can't properly signal error without knowing which topics/partitions
 			// were requested. The connection will likely be closed by the client after this invalid request.
-			err = k.sendResponse(conn, connID, correlationID, &resp)
+			handleErr = k.sendResponse(conn, connID, hdr.correlationID, &resp)
 		} else {
-			err = k.handleProduceReq(conn, connID, remoteAddr, correlationID, &req, &resp)
+			handleErr = k.handleProduceReq(conn, connID, remoteAddr, hdr.correlationID, &req, &resp)
 		}
 	default:
-		k.logger.Warnf("[conn:%d] Unsupported API key: %d, closing connection", connID, apiKey)
+		k.logger.Warnf("[conn:%d] Unsupported API key: %d, closing connection", connID, hdr.apiKey)
 		// For unsupported API keys, we can't construct a proper response since we don't know the structure
 		// The best approach is to close the connection, which signals an error to the client
-		return false, fmt.Errorf("unsupported API key: %d", apiKey)
+		return false, fmt.Errorf("unsupported API key: %d", hdr.apiKey)
 	}
 
-	return authUpdated, err
+	return authUpdated, handleErr
 }
 
 func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, correlationID int32, data []byte, apiVersion int16, connState *connectionState) error {
@@ -728,16 +757,21 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, cor
 		k.logger.Errorf("[conn:%d] Failed to parse SASL handshake request: %v", connID, err)
 		// Send proper error response instead of generic error
 		resp.ErrorCode = kerr.InvalidRequest.Code
-		resp.SupportedMechanisms = k.saslMechanisms
+		// Send supported mechanisms as-is
+		supported := make([]string, 0, len(k.saslMechanisms))
+		for _, m := range k.saslMechanisms {
+			supported = append(supported, m)
+		}
+		resp.SupportedMechanisms = supported
 		return k.sendResponse(conn, connID, correlationID, &resp)
 	}
 
 	k.logger.Debugf("[conn:%d] SASL mechanism %s requested", connID, req.Mechanism)
 
-	// Check if requested mechanism is supported
+	// Check if requested mechanism is in our enabled list
 	supported := false
 	for _, mech := range k.saslMechanisms {
-		if req.Mechanism == mech {
+		if mech == req.Mechanism {
 			supported = true
 			break
 		}
@@ -746,14 +780,15 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, cor
 	if supported {
 		k.logger.Debugf("[conn:%d] SASL mechanism %s accepted", connID, req.Mechanism)
 		resp.ErrorCode = 0
-		resp.SupportedMechanisms = k.saslMechanisms
 		// Store the mechanism for this connection
 		connState.scramMechanism = req.Mechanism
 	} else {
 		k.logger.Warnf("[conn:%d] Unsupported SASL mechanism requested: %s", connID, req.Mechanism)
 		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
-		resp.SupportedMechanisms = k.saslMechanisms
 	}
+
+	// Always send supported mechanism list
+	resp.SupportedMechanisms = append([]string{}, k.saslMechanisms...)
 
 	return k.sendResponse(conn, connID, correlationID, &resp)
 }
@@ -772,8 +807,19 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 	b := kbin.Reader{Src: data}
 	var authBytes []byte
 	if apiVersion >= 2 {
+		// v2 uses COMPACT_BYTES, but be tolerant: some clients mistakenly send Int32 (BYTES) prefixed data.
 		authBytes = b.CompactBytes()
 		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as CompactBytes (len=%d)", connID, len(authBytes))
+
+		// Heuristic fallback: if compact parsing resulted in empty bytes or the payload
+		// looks like an Int32 length-prefixed buffer, try parsing that format.
+		if len(authBytes) == 0 && len(data) >= 4 {
+			payloadLen := int(binary.BigEndian.Uint32(data[0:4]))
+			if payloadLen <= len(data)-4 {
+				authBytes = data[4 : 4+payloadLen]
+				k.logger.Debugf("[conn:%d] Fallback parsed SASL auth bytes as Int32 BYTES (len=%d)", connID, len(authBytes))
+			}
+		}
 	} else {
 		authBytes = b.Bytes()
 		k.logger.Debugf("[conn:%d] Parsed SASL auth bytes as Bytes (len=%d)", connID, len(authBytes))
@@ -793,7 +839,7 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 	// Handle authentication based on mechanism
 	k.logger.Debugf("[conn:%d] handleSaslAuthenticate: mechanism=%s, authBytes len=%d", connID, connState.scramMechanism, len(authBytes))
 	switch connState.scramMechanism {
-	case "PLAIN":
+	case saslMechanismPlain:
 		// Validate PLAIN credentials
 		authenticated = k.validatePlain(connID, authBytes)
 		if authenticated {
@@ -806,7 +852,7 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 			resp.ErrorMessage = &errMsg
 		}
 
-	case "SCRAM-SHA-256", "SCRAM-SHA-512":
+	case saslMechanismScramSha256, saslMechanismScramSha512:
 		// Handle SCRAM challenge-response
 		var authErr error
 		authenticated, authErr = k.handleSCRAMAuth(connID, authBytes, connState, resp)
@@ -831,9 +877,9 @@ func (k *kafkaServerInput) handleSaslAuthenticate(conn net.Conn, connID uint64, 
 }
 
 // getCredentialLookup returns a credential lookup function for the specified SCRAM mechanism.
-func (k *kafkaServerInput) getCredentialLookup(connID uint64, mechanism string) (scram.CredentialLookup, map[string]scram.StoredCredentials) {
+func (k *kafkaServerInput) getCredentialLookup(connID uint64, mechanism string) scram.CredentialLookup {
 	var credsMap map[string]scram.StoredCredentials
-	if mechanism == "SCRAM-SHA-512" {
+	if mechanism == saslMechanismScramSha512 {
 		credsMap = k.saslSCRAM512Credentials
 	} else {
 		credsMap = k.saslSCRAM256Credentials
@@ -846,30 +892,41 @@ func (k *kafkaServerInput) getCredentialLookup(connID uint64, mechanism string) 
 			return scram.StoredCredentials{}, fmt.Errorf("user not found: %s", username)
 		}
 		return creds, nil
-	}, credsMap
+	}
+}
+
+// newSCRAMServer creates a new SCRAM server for the specified mechanism.
+func newSCRAMServer(mechanism string, credLookup scram.CredentialLookup) (*scram.Server, error) {
+	switch mechanism {
+	case saslMechanismScramSha256:
+		return scram.SHA256.NewServer(credLookup)
+	case saslMechanismScramSha512:
+		return scram.SHA512.NewServer(credLookup)
+	default:
+		return nil, fmt.Errorf("unsupported SCRAM mechanism: %s", mechanism)
+	}
 }
 
 // handleSCRAMAuth handles SCRAM challenge-response authentication
 func (k *kafkaServerInput) handleSCRAMAuth(connID uint64, authBytes []byte, connState *connectionState, resp *kmsg.SASLAuthenticateResponse) (bool, error) {
+	// Trim leading control bytes (0x00/0x01) that some clients may include
+	for len(authBytes) > 0 && (authBytes[0] == 0x00 || authBytes[0] == 0x01) {
+		authBytes = authBytes[1:]
+	}
+
+	// Trim trailing NUL padding that some clients append
+	for len(authBytes) > 0 && authBytes[len(authBytes)-1] == 0x00 {
+		authBytes = authBytes[:len(authBytes)-1]
+	}
+
 	clientMessage := string(authBytes)
 
 	// If this is the first message (no conversation yet), create one
 	if connState.scramConversation == nil {
 		k.logger.Debugf("[conn:%d] Starting SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
 
-		credLookup, _ := k.getCredentialLookup(connID, connState.scramMechanism)
-
-		// Create SCRAM server based on mechanism
-		var scramServer *scram.Server
-		var err error
-		if connState.scramMechanism == "SCRAM-SHA-256" {
-			scramServer, err = scram.SHA256.NewServer(credLookup)
-		} else if connState.scramMechanism == "SCRAM-SHA-512" {
-			scramServer, err = scram.SHA512.NewServer(credLookup)
-		} else {
-			return false, fmt.Errorf("unsupported SCRAM mechanism: %s", connState.scramMechanism)
-		}
-
+		credLookup := k.getCredentialLookup(connID, connState.scramMechanism)
+		scramServer, err := newSCRAMServer(connState.scramMechanism, credLookup)
 		if err != nil {
 			k.logger.Errorf("[conn:%d] Failed to create SCRAM server: %v", connID, err)
 			return false, fmt.Errorf("failed to create SCRAM server: %w", err)
@@ -994,6 +1051,17 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, connID uint64, corre
 		port = 9092
 	}
 
+	// If listening on wildcard address, use the connection's local address
+	// so clients can connect back to the same interface they reached us on
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		if localAddr := conn.LocalAddr(); localAddr != nil {
+			if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil && localHost != "" {
+				k.logger.Debugf("[conn:%d] Using connection local address %s instead of wildcard %s", connID, localHost, host)
+				host = localHost
+			}
+		}
+	}
+
 	k.logger.Debugf("[conn:%d] Broker metadata: host=%s, port=%d", connID, host, port)
 
 	resp.Brokers = []kmsg.MetadataResponseBroker{
@@ -1086,6 +1154,10 @@ func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int
 func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remoteAddr string, correlationID int32, req *kmsg.ProduceRequest, resp *kmsg.ProduceResponse) error {
 	k.logger.Infof("[conn:%d] Produce request: correlationID=%d, acks=%d, topics=%d", connID, correlationID, req.Acks, len(req.Topics))
 
+	// Create context with timeout for this request
+	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	defer cancel()
+
 	var batch service.MessageBatch
 
 	// Iterate through topics using kmsg's typed structures
@@ -1152,14 +1224,14 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	select {
 	case msgChan <- messageBatch{
 		batch: batch,
-		ackFn: func(ctx context.Context, err error) error {
+		ackFn: func(ackCtx context.Context, err error) error {
 			resChan <- err
 			return nil
 		},
 		resChan: resChan,
 	}:
 		k.logger.Debugf("[conn:%d] Successfully sent batch to pipeline", connID)
-	case <-time.After(k.timeout):
+	case <-ctx.Done():
 		k.logger.Warnf("[conn:%d] Timeout sending batch to pipeline", connID)
 		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
 		return k.sendResponse(conn, connID, correlationID, resp)
@@ -1178,7 +1250,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 				errorCode = kerr.UnknownServerError.Code
 			}
 			resp.Topics = buildProduceResponseTopics(req.Topics, errorCode)
-		case <-time.After(k.timeout):
+		case <-ctx.Done():
 			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
 		case <-k.shutdownCh:
 			return fmt.Errorf("shutting down")
@@ -1252,7 +1324,8 @@ func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic st
 		k.logger.Debugf("[conn:%d] Decompressed %d bytes to %d bytes", connID, len(recordBatch.Records), len(recordsData))
 	}
 
-	var batch service.MessageBatch
+	// Pre-allocate batch with expected capacity
+	batch := make(service.MessageBatch, 0, recordBatch.NumRecords)
 
 	// Parse individual records from the Records byte array
 	offset := 0
