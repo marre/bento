@@ -644,10 +644,9 @@ address: "127.0.0.1:19097"
 		Value: []byte("test-value-acks-0"),
 	}
 
-	// We can't easily force kgo to use acks=0 per record, but we can configure the client
-	// However, for this test we want to verify the server handles it.
+	// It's not easy to force kgo to use acks=0 per record, but the client can be configured.
 	// The franz-go client defaults to acks=all.
-	// To test acks=0, we might need to construct a raw request or configure the client.
+	// To test acks=0, construct a raw request or configure the client with kgo.RequiredAcks.
 	// kgo.RequiredAcks(kgo.NoAck())
 
 	clientAcks0, err := kgo.NewClient(
@@ -752,7 +751,7 @@ address: "127.0.0.1:19098"
 	}
 }
 
-// Quick round-trip test: ensure the metadata response we construct can be
+// Quick round-trip test: ensure the metadata response constructed can be
 // appended-to a buffer and parsed back by kmsg to avoid the 'not enough
 // data' errors the client observed in integration tests.
 func TestApiVersionsResponseStructure(t *testing.T) {

@@ -9,13 +9,13 @@ import (
 	"github.com/xdg-go/scram"
 )
 
-// TestSCRAMCredentialGeneration verifies that our manual credential generation
-// produces valid credentials that work with xdg-go/scram's server
+// TestSCRAMCredentialGeneration verifies that the manual credential generation
+// produces valid credentials that work with xdg-go/scram's server.
 func TestSCRAMCredentialGeneration(t *testing.T) {
 	username := "testuser"
 	password := "testpass"
 
-	// Generate credentials using our function
+	// Generate credentials using the helper function
 	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", password)
 	require.NoError(t, err)
 
@@ -30,7 +30,7 @@ func TestSCRAMCredentialGeneration(t *testing.T) {
 	assert.Equal(t, 32, len(serverCreds.StoredKey), "SHA-256 should produce 32-byte StoredKey")
 	assert.Equal(t, 32, len(serverCreds.ServerKey), "SHA-256 should produce 32-byte ServerKey")
 
-	// Create a credential lookup that returns our credentials
+	// Create a credential lookup that returns the generated credentials
 	credLookup := func(user string) (scram.StoredCredentials, error) {
 		if user == username {
 			return serverCreds, nil

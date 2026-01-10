@@ -236,8 +236,8 @@ type messageBatch struct {
 }
 
 // generateSCRAMCredentials generates SCRAM stored credentials from a plaintext password.
-// This manually generates StoredKey and ServerKey following RFC 5802, compatible with Kafka.
-// Note: username is not part of key derivation per RFC 5802 - it's only used to look up credentials.
+// Generates StoredKey and ServerKey following RFC 5802, compatible with Kafka.
+// Username is not part of key derivation per RFC 5802 - it is only used to look up credentials.
 func generateSCRAMCredentials(mechanism, password string) (scram.StoredCredentials, error) {
 	// Generate a random salt
 	salt := make([]byte, scramSaltSize)
@@ -278,10 +278,10 @@ func generateSCRAMCredentials(mechanism, password string) (scram.StoredCredentia
 	serverKeyHMAC.Write([]byte(scramServerKeyLabel))
 	serverKey := serverKeyHMAC.Sum(nil)
 
-	// Return credentials in xdg-go/scram format
+	// Return credentials in xdg-go/scram format.
 	// Salt must be stored as raw bytes (in the string). The xdg-go SCRAM
-	// library will Base64 encode the salt when emitting the server-first
-	// message, so we store the salt as raw bytes in the string.
+	// library Base64-encodes the salt when emitting the server-first message,
+	// so the salt is stored as raw bytes in the string.
 	return scram.StoredCredentials{
 		KeyFactors: scram.KeyFactors{
 			Salt:  string(salt),
@@ -737,7 +737,7 @@ func (k *kafkaServerInput) handleRequest(conn net.Conn, connID uint64, remoteAdd
 		}
 	default:
 		k.logger.Warnf("[conn:%d] Unsupported API key: %d, closing connection", connID, hdr.apiKey)
-		// For unsupported API keys, we can't construct a proper response since we don't know the structure
+		// For unsupported API keys, a proper response cannot be constructed without knowing the structure
 		// The best approach is to close the connection, which signals an error to the client
 		return false, fmt.Errorf("unsupported API key: %d", hdr.apiKey)
 	}
@@ -758,17 +758,13 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, cor
 		// Send proper error response instead of generic error
 		resp.ErrorCode = kerr.InvalidRequest.Code
 		// Send supported mechanisms as-is
-		supported := make([]string, 0, len(k.saslMechanisms))
-		for _, m := range k.saslMechanisms {
-			supported = append(supported, m)
-		}
-		resp.SupportedMechanisms = supported
+		resp.SupportedMechanisms = append([]string{}, k.saslMechanisms...)
 		return k.sendResponse(conn, connID, correlationID, &resp)
 	}
 
 	k.logger.Debugf("[conn:%d] SASL mechanism %s requested", connID, req.Mechanism)
 
-	// Check if requested mechanism is in our enabled list
+	// Check if requested mechanism is in the enabled list
 	supported := false
 	for _, mech := range k.saslMechanisms {
 		if mech == req.Mechanism {
@@ -1001,10 +997,10 @@ func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, connID uint64, co
 
 	resp.ErrorCode = 0
 
-	// Advertise support for ApiVersions, Metadata, and Produce
-	// We support flexible versions for all APIs
+	// Advertise support for ApiVersions, Metadata, and Produce.
+	// Flexible versions are supported for all APIs.
 	resp.ApiKeys = []kmsg.ApiVersionsResponseApiKey{
-		{ApiKey: int16(kmsg.ApiVersions), MinVersion: 0, MaxVersion: 3}, // ApiVersions (we handle v3 flexible)
+		{ApiKey: int16(kmsg.ApiVersions), MinVersion: 0, MaxVersion: 3}, // ApiVersions (v3 flexible)
 		{ApiKey: int16(kmsg.Metadata), MinVersion: 0, MaxVersion: 12},   // Metadata (support up to v12)
 		{ApiKey: int16(kmsg.Produce), MinVersion: 0, MaxVersion: 9},     // Produce (support up to v9)
 	}
@@ -1052,7 +1048,7 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, connID uint64, corre
 	}
 
 	// If listening on wildcard address, use the connection's local address
-	// so clients can connect back to the same interface they reached us on
+	// so clients can connect back to the same interface they reached the server on
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		if localAddr := conn.LocalAddr(); localAddr != nil {
 			if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil && localHost != "" {
@@ -1345,7 +1341,7 @@ func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic st
 
 		if recordErr != nil {
 			k.logger.Warnf("[conn:%d] Failed to parse record %d: %v", connID, i, recordErr)
-			// Can't reliably skip this record since we don't know its length
+			// Cannot reliably skip this record since the length is unknown
 			break
 		}
 

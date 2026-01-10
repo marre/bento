@@ -16,7 +16,7 @@ func TestXDGSCRAMWithFranzClient(t *testing.T) {
 	username := "testuser"
 	password := "testpass"
 
-	// Generate credentials using our function
+	// Generate credentials using the helper function
 	serverCreds, err := generateSCRAMCredentials("SCRAM-SHA-256", password)
 	require.NoError(t, err)
 
