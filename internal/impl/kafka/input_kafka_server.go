@@ -1367,7 +1367,7 @@ func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic st
 	return k.parseRecordBatchV2(connID, data, topic, partition, remoteAddr)
 }
 
-// parseMessageSet handles legacy MessageSet format (magic 0 or 1)
+// parseMessageSet handles legacy MessageSet format (magic 0 or 1) using kmsg types
 func (k *kafkaServerInput) parseMessageSet(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
 	k.logger.Debugf("[conn:%d] Parsing legacy MessageSet format", connID)
 
@@ -1375,126 +1375,93 @@ func (k *kafkaServerInput) parseMessageSet(connID uint64, data []byte, topic str
 	offset := 0
 
 	for offset < len(data) {
-		// MessageSet format:
-		// Offset: int64 (8 bytes)
-		// MessageSize: int32 (4 bytes)
-		// CRC: int32 (4 bytes)
-		// Magic: int8 (1 byte)
-		// Attributes: int8 (1 byte)
-		// Timestamp: int64 (8 bytes) - only for magic >= 1
-		// Key: bytes (4 byte length + data)
-		// Value: bytes (4 byte length + data)
-
-		if offset+12 > len(data) {
+		if offset+17 > len(data) { // Minimum size: 8 (offset) + 4 (size) + 4 (crc) + 1 (magic)
 			k.logger.Debugf("[conn:%d] End of MessageSet at offset %d", connID, offset)
 			break
 		}
 
-		// Read offset and message size
-		msgOffset := int64(binary.BigEndian.Uint64(data[offset:]))
-		messageSize := int32(binary.BigEndian.Uint32(data[offset+8:]))
+		// Check magic byte to determine v0 or v1
+		magic := data[offset+16]
 
-		if offset+12+int(messageSize) > len(data) {
-			k.logger.Warnf("[conn:%d] MessageSet message truncated at offset %d", connID, offset)
-			break
-		}
-
-		// Move past offset and messageSize
-		pos := offset + 12
-
-		// CRC (4 bytes) - skip
-		pos += 4
-
-		// Magic (1 byte)
-		magic := data[pos]
-		pos++
-
-		// Attributes (1 byte)
-		attributes := data[pos]
-		compression := attributes & 0x07
-		pos++
-
-		// Timestamp (8 bytes) - only for magic >= 1
-		var timestamp int64
-		if magic >= 1 {
-			timestamp = int64(binary.BigEndian.Uint64(data[pos:]))
-			pos += 8
-		}
-
-		// Key length (4 bytes)
-		keyLen := int32(binary.BigEndian.Uint32(data[pos:]))
-		pos += 4
-
-		// Key data
-		var key []byte
-		if keyLen >= 0 {
-			if pos+int(keyLen) > len(data) {
-				k.logger.Warnf("[conn:%d] Key data truncated", connID)
+		if magic == 0 {
+			// Parse as MessageV0
+			msgV0 := kmsg.NewMessageV0()
+			if err := msgV0.ReadFrom(data[offset:]); err != nil {
+				k.logger.Warnf("[conn:%d] Failed to parse MessageV0: %v", connID, err)
 				break
 			}
-			key = data[pos : pos+int(keyLen)]
-			pos += int(keyLen)
-		}
 
-		// Value length (4 bytes)
-		if pos+4 > len(data) {
-			k.logger.Warnf("[conn:%d] Value length truncated", connID)
-			break
-		}
-		valueLen := int32(binary.BigEndian.Uint32(data[pos:]))
-		pos += 4
-
-		// Value data
-		var value []byte
-		if valueLen >= 0 {
-			if pos+int(valueLen) > len(data) {
-				k.logger.Warnf("[conn:%d] Value data truncated", connID)
-				break
-			}
-			value = data[pos : pos+int(valueLen)]
-		}
-
-		// Handle compression if present
-		if compression != 0 {
-			k.logger.Debugf("[conn:%d] MessageSet compression: %d", connID, compression)
-			decompressed, err := decompressRecords(value, int8(compression))
-			if err != nil {
-				k.logger.Warnf("[conn:%d] Failed to decompress MessageSet: %v", connID, err)
-			} else {
-				// Recursively parse the decompressed data as another MessageSet
-				innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
+			// Handle compression
+			compression := msgV0.Attributes & 0x07
+			if compression != 0 {
+				decompressed, err := decompressRecords(msgV0.Value, int8(compression))
 				if err != nil {
-					k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
+					k.logger.Warnf("[conn:%d] Failed to decompress MessageV0: %v", connID, err)
 				} else {
-					batch = append(batch, innerBatch...)
+					innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
+					if err != nil {
+						k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
+					} else {
+						batch = append(batch, innerBatch...)
+					}
 				}
+			} else {
+				msg := service.NewMessage(msgV0.Value)
+				msg.MetaSetMut("kafka_server_topic", topic)
+				msg.MetaSetMut("kafka_server_partition", int(partition))
+				msg.MetaSetMut("kafka_server_offset", msgV0.Offset)
+				msg.MetaSetMut("kafka_server_tombstone_message", msgV0.Value == nil)
+				if msgV0.Key != nil {
+					msg.MetaSetMut("kafka_server_key", string(msgV0.Key))
+				}
+				msg.MetaSetMut("kafka_server_client_address", remoteAddr)
+				batch = append(batch, msg)
 			}
-		} else {
-			// Create Bento message
-			msg := service.NewMessage(value)
-			msg.MetaSetMut("kafka_server_topic", topic)
-			msg.MetaSetMut("kafka_server_partition", int(partition))
-			msg.MetaSetMut("kafka_server_offset", msgOffset)
-			msg.MetaSetMut("kafka_server_tombstone_message", value == nil)
 
-			if key != nil {
-				msg.MetaSetMut("kafka_server_key", string(key))
+			offset += 8 + 4 + int(msgV0.MessageSize) // Offset + MessageSize field + message content
+		} else if magic == 1 {
+			// Parse as MessageV1
+			msgV1 := kmsg.NewMessageV1()
+			if err := msgV1.ReadFrom(data[offset:]); err != nil {
+				k.logger.Warnf("[conn:%d] Failed to parse MessageV1: %v", connID, err)
+				break
 			}
 
-			if magic >= 1 {
-				timestampTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
+			// Handle compression
+			compression := msgV1.Attributes & 0x07
+			if compression != 0 {
+				decompressed, err := decompressRecords(msgV1.Value, int8(compression))
+				if err != nil {
+					k.logger.Warnf("[conn:%d] Failed to decompress MessageV1: %v", connID, err)
+				} else {
+					innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
+					if err != nil {
+						k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
+					} else {
+						batch = append(batch, innerBatch...)
+					}
+				}
+			} else {
+				msg := service.NewMessage(msgV1.Value)
+				msg.MetaSetMut("kafka_server_topic", topic)
+				msg.MetaSetMut("kafka_server_partition", int(partition))
+				msg.MetaSetMut("kafka_server_offset", msgV1.Offset)
+				msg.MetaSetMut("kafka_server_tombstone_message", msgV1.Value == nil)
+				if msgV1.Key != nil {
+					msg.MetaSetMut("kafka_server_key", string(msgV1.Key))
+				}
+				timestampTime := time.Unix(msgV1.Timestamp/1000, (msgV1.Timestamp%1000)*1000000)
 				msg.MetaSetMut("kafka_server_timestamp_unix", timestampTime.Unix())
 				msg.MetaSetMut("kafka_server_timestamp", timestampTime.Format(time.RFC3339))
+				msg.MetaSetMut("kafka_server_client_address", remoteAddr)
+				batch = append(batch, msg)
 			}
 
-			msg.MetaSetMut("kafka_server_client_address", remoteAddr)
-
-			batch = append(batch, msg)
-			k.logger.Debugf("[conn:%d] Parsed message: offset=%d, keyLen=%d, valueLen=%d", connID, msgOffset, keyLen, valueLen)
+			offset += 8 + 4 + int(msgV1.MessageSize) // Offset + MessageSize field + message content
+		} else {
+			k.logger.Warnf("[conn:%d] Unexpected magic byte %d in MessageSet", connID, magic)
+			break
 		}
-
-		// Move to next message
-		offset += 12 + int(messageSize)
 	}
 
 	k.logger.Debugf("[conn:%d] Parsed %d messages from MessageSet", connID, len(batch))
