@@ -1260,6 +1260,42 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	return k.sendResponse(conn, connID, correlationID, resp)
 }
 
+// xerialSnappyMagic is the magic header for Xerial snappy framing used by Kafka.
+// Format: 0x82 "SNAPPY" 0x00
+var xerialSnappyMagic = []byte{0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00}
+
+// decodeXerialSnappy decodes Xerial-framed snappy data (used by Kafka).
+// Format: 8-byte magic, 8-byte version info, then chunks of (4-byte size + snappy data).
+func decodeXerialSnappy(data []byte) ([]byte, error) {
+	if len(data) < 16 {
+		return nil, fmt.Errorf("xerial snappy data too short: %d bytes", len(data))
+	}
+
+	// Skip magic (8 bytes) and version info (8 bytes)
+	data = data[16:]
+
+	var result []byte
+	for len(data) > 0 {
+		if len(data) < 4 {
+			return nil, fmt.Errorf("xerial snappy: incomplete chunk size")
+		}
+		chunkSize := int(binary.BigEndian.Uint32(data))
+		data = data[4:]
+
+		if chunkSize < 0 || chunkSize > len(data) {
+			return nil, fmt.Errorf("xerial snappy: invalid chunk size %d", chunkSize)
+		}
+
+		decoded, err := snappy.Decode(nil, data[:chunkSize])
+		if err != nil {
+			return nil, fmt.Errorf("xerial snappy: failed to decode chunk: %w", err)
+		}
+		result = append(result, decoded...)
+		data = data[chunkSize:]
+	}
+	return result, nil
+}
+
 // decompressRecords decompresses Kafka record data based on the compression codec
 func decompressRecords(data []byte, codec int8) ([]byte, error) {
 	switch codec {
@@ -1273,14 +1309,31 @@ func decompressRecords(data []byte, codec int8) ([]byte, error) {
 		defer reader.Close()
 		return io.ReadAll(reader)
 	case codecSnappy:
+		// Check for Xerial snappy framing (used by Kafka Java client and others)
+		if len(data) >= 8 && bytes.HasPrefix(data, xerialSnappyMagic) {
+			return decodeXerialSnappy(data)
+		}
+		// Fall back to raw snappy
 		decoded, err := snappy.Decode(nil, data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode snappy: %w", err)
 		}
 		return decoded, nil
 	case codecLZ4:
+		// Try standard LZ4 frame format first
 		reader := lz4.NewReader(bytes.NewReader(data))
-		return io.ReadAll(reader)
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			// Some clients use raw LZ4 blocks without frame wrapper
+			// Try block decompression as fallback
+			blockDecoded := make([]byte, 10*len(data)) // Allocate generous buffer
+			n, err2 := lz4.UncompressBlock(data, blockDecoded)
+			if err2 != nil {
+				return nil, fmt.Errorf("failed to decompress lz4 (frame: %v, block: %v)", err, err2)
+			}
+			return blockDecoded[:n], nil
+		}
+		return decoded, nil
 	case codecZstd:
 		decoder, err := zstd.NewReader(bytes.NewReader(data))
 		if err != nil {
@@ -1294,6 +1347,162 @@ func decompressRecords(data []byte, codec int8) ([]byte, error) {
 }
 
 func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
+	// Check magic byte at offset 16 to determine format
+	// Offset 16 is where magic byte appears in both MessageSet and RecordBatch formats
+	// Magic 0 or 1 = legacy MessageSet format
+	// Magic 2 = v2 RecordBatch format
+	if len(data) < 17 {
+		return nil, fmt.Errorf("data too short: %d bytes", len(data))
+	}
+
+	magic := data[16]
+	k.logger.Debugf("[conn:%d] Record format magic byte: %d", connID, magic)
+
+	if magic < 2 {
+		// Legacy MessageSet format (magic 0 or 1)
+		return k.parseMessageSet(connID, data, topic, partition, remoteAddr)
+	}
+
+	// v2 RecordBatch format
+	return k.parseRecordBatchV2(connID, data, topic, partition, remoteAddr)
+}
+
+// parseMessageSet handles legacy MessageSet format (magic 0 or 1)
+func (k *kafkaServerInput) parseMessageSet(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
+	k.logger.Debugf("[conn:%d] Parsing legacy MessageSet format", connID)
+
+	var batch service.MessageBatch
+	offset := 0
+
+	for offset < len(data) {
+		// MessageSet format:
+		// Offset: int64 (8 bytes)
+		// MessageSize: int32 (4 bytes)
+		// CRC: int32 (4 bytes)
+		// Magic: int8 (1 byte)
+		// Attributes: int8 (1 byte)
+		// Timestamp: int64 (8 bytes) - only for magic >= 1
+		// Key: bytes (4 byte length + data)
+		// Value: bytes (4 byte length + data)
+
+		if offset+12 > len(data) {
+			k.logger.Debugf("[conn:%d] End of MessageSet at offset %d", connID, offset)
+			break
+		}
+
+		// Read offset and message size
+		msgOffset := int64(binary.BigEndian.Uint64(data[offset:]))
+		messageSize := int32(binary.BigEndian.Uint32(data[offset+8:]))
+
+		if offset+12+int(messageSize) > len(data) {
+			k.logger.Warnf("[conn:%d] MessageSet message truncated at offset %d", connID, offset)
+			break
+		}
+
+		// Move past offset and messageSize
+		pos := offset + 12
+
+		// CRC (4 bytes) - skip
+		pos += 4
+
+		// Magic (1 byte)
+		magic := data[pos]
+		pos++
+
+		// Attributes (1 byte)
+		attributes := data[pos]
+		compression := attributes & 0x07
+		pos++
+
+		// Timestamp (8 bytes) - only for magic >= 1
+		var timestamp int64
+		if magic >= 1 {
+			timestamp = int64(binary.BigEndian.Uint64(data[pos:]))
+			pos += 8
+		}
+
+		// Key length (4 bytes)
+		keyLen := int32(binary.BigEndian.Uint32(data[pos:]))
+		pos += 4
+
+		// Key data
+		var key []byte
+		if keyLen >= 0 {
+			if pos+int(keyLen) > len(data) {
+				k.logger.Warnf("[conn:%d] Key data truncated", connID)
+				break
+			}
+			key = data[pos : pos+int(keyLen)]
+			pos += int(keyLen)
+		}
+
+		// Value length (4 bytes)
+		if pos+4 > len(data) {
+			k.logger.Warnf("[conn:%d] Value length truncated", connID)
+			break
+		}
+		valueLen := int32(binary.BigEndian.Uint32(data[pos:]))
+		pos += 4
+
+		// Value data
+		var value []byte
+		if valueLen >= 0 {
+			if pos+int(valueLen) > len(data) {
+				k.logger.Warnf("[conn:%d] Value data truncated", connID)
+				break
+			}
+			value = data[pos : pos+int(valueLen)]
+		}
+
+		// Handle compression if present
+		if compression != 0 {
+			k.logger.Debugf("[conn:%d] MessageSet compression: %d", connID, compression)
+			decompressed, err := decompressRecords(value, int8(compression))
+			if err != nil {
+				k.logger.Warnf("[conn:%d] Failed to decompress MessageSet: %v", connID, err)
+			} else {
+				// Recursively parse the decompressed data as another MessageSet
+				innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
+				if err != nil {
+					k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
+				} else {
+					batch = append(batch, innerBatch...)
+				}
+			}
+		} else {
+			// Create Bento message
+			msg := service.NewMessage(value)
+			msg.MetaSetMut("kafka_server_topic", topic)
+			msg.MetaSetMut("kafka_server_partition", int(partition))
+			msg.MetaSetMut("kafka_server_offset", msgOffset)
+			msg.MetaSetMut("kafka_server_tombstone_message", value == nil)
+
+			if key != nil {
+				msg.MetaSetMut("kafka_server_key", string(key))
+			}
+
+			if magic >= 1 {
+				timestampTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
+				msg.MetaSetMut("kafka_server_timestamp_unix", timestampTime.Unix())
+				msg.MetaSetMut("kafka_server_timestamp", timestampTime.Format(time.RFC3339))
+			}
+
+			msg.MetaSetMut("kafka_server_client_address", remoteAddr)
+
+			batch = append(batch, msg)
+			k.logger.Debugf("[conn:%d] Parsed message: offset=%d, keyLen=%d, valueLen=%d", connID, msgOffset, keyLen, valueLen)
+		}
+
+		// Move to next message
+		offset += 12 + int(messageSize)
+	}
+
+	k.logger.Debugf("[conn:%d] Parsed %d messages from MessageSet", connID, len(batch))
+	return batch, nil
+}
+
+// parseRecordBatchV2 handles v2 RecordBatch format (magic 2)
+func (k *kafkaServerInput) parseRecordBatchV2(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
 	// Use kmsg.RecordBatch to parse the batch header
 	recordBatch := kmsg.RecordBatch{}
 

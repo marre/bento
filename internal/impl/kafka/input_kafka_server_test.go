@@ -905,6 +905,121 @@ address: "127.0.0.1:19099"
 	t.Logf("Successfully received %d compressed messages", receivedCount)
 }
 
+func TestKafkaServerInputLegacyMessageSet(t *testing.T) {
+	// Test that we can parse legacy MessageSet format (magic 0)
+	// This format is used by some older clients like confluent-kafka with MsgVersion 0
+
+	// Build a legacy MessageSet (magic 0) manually
+	// Format: Offset(8) + MessageSize(4) + CRC(4) + Magic(1) + Attributes(1) + Key(4+data) + Value(4+data)
+	value := []byte(`{"test":"legacy"}`)
+	key := []byte("test-key")
+
+	var msgBuf bytes.Buffer
+	// Offset
+	binary.Write(&msgBuf, binary.BigEndian, int64(0))
+	// MessageSize (CRC + Magic + Attributes + Key + Value = 4 + 1 + 1 + 4 + len(key) + 4 + len(value))
+	messageSize := int32(4 + 1 + 1 + 4 + len(key) + 4 + len(value))
+	binary.Write(&msgBuf, binary.BigEndian, messageSize)
+	// CRC (dummy value, we don't validate it)
+	binary.Write(&msgBuf, binary.BigEndian, int32(0x12345678))
+	// Magic (0 for legacy format)
+	msgBuf.WriteByte(0)
+	// Attributes (0 = no compression)
+	msgBuf.WriteByte(0)
+	// Key length + key
+	binary.Write(&msgBuf, binary.BigEndian, int32(len(key)))
+	msgBuf.Write(key)
+	// Value length + value
+	binary.Write(&msgBuf, binary.BigEndian, int32(len(value)))
+	msgBuf.Write(value)
+
+	recordsData := msgBuf.Bytes()
+
+	// Create a minimal kafkaServerInput for testing
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+	config := `address: "127.0.0.1:19999"`
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	// Directly test parseRecordBatch which should detect legacy format
+	batch, err := input.parseRecordBatch(1, recordsData, "test-topic", 0, "127.0.0.1:12345")
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msgBytes, err := batch[0].AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, value, msgBytes)
+
+	msgKey, exists := batch[0].MetaGet("kafka_server_key")
+	assert.True(t, exists)
+	assert.Equal(t, string(key), msgKey)
+
+	t.Log("Successfully parsed legacy MessageSet format (magic 0)")
+}
+
+func TestKafkaServerInputLegacyMessageSetMagic1(t *testing.T) {
+	// Test legacy MessageSet format with magic 1 (includes timestamp)
+	value := []byte(`{"test":"legacy_v1"}`)
+	key := []byte("key-v1")
+	timestamp := int64(1700000000000) // some timestamp in ms
+
+	var msgBuf bytes.Buffer
+	// Offset
+	binary.Write(&msgBuf, binary.BigEndian, int64(42))
+	// MessageSize (CRC + Magic + Attributes + Timestamp + Key + Value)
+	messageSize := int32(4 + 1 + 1 + 8 + 4 + len(key) + 4 + len(value))
+	binary.Write(&msgBuf, binary.BigEndian, messageSize)
+	// CRC (dummy value)
+	binary.Write(&msgBuf, binary.BigEndian, uint32(0xDEADBEEF))
+	// Magic (1 for v1 format with timestamp)
+	msgBuf.WriteByte(1)
+	// Attributes (0 = no compression)
+	msgBuf.WriteByte(0)
+	// Timestamp (only for magic >= 1)
+	binary.Write(&msgBuf, binary.BigEndian, timestamp)
+	// Key length + key
+	binary.Write(&msgBuf, binary.BigEndian, int32(len(key)))
+	msgBuf.Write(key)
+	// Value length + value
+	binary.Write(&msgBuf, binary.BigEndian, int32(len(value)))
+	msgBuf.Write(value)
+
+	recordsData := msgBuf.Bytes()
+
+	// Create a minimal kafkaServerInput for testing
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+	config := `address: "127.0.0.1:19999"`
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	batch, err := input.parseRecordBatch(1, recordsData, "test-topic", 0, "127.0.0.1:12345")
+	require.NoError(t, err)
+	require.Len(t, batch, 1)
+
+	msgBytes, err := batch[0].AsBytes()
+	require.NoError(t, err)
+	assert.Equal(t, value, msgBytes)
+
+	msgKey, exists := batch[0].MetaGet("kafka_server_key")
+	assert.True(t, exists)
+	assert.Equal(t, string(key), msgKey)
+
+	// Verify timestamp was parsed
+	tsUnix, exists := batch[0].MetaGet("kafka_server_timestamp_unix")
+	assert.True(t, exists)
+	assert.Equal(t, "1700000000", tsUnix)
+
+	t.Log("Successfully parsed legacy MessageSet format (magic 1)")
+}
+
 func TestKafkaServerInputSASLPlain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
