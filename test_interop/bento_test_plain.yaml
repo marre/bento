@@ -1,0 +1,14 @@
+# Bento config - kafka_server with SASL PLAIN on port 19201
+input:
+  kafka_server:
+    address: "127.0.0.1:19201"
+    timeout: "10s"
+    sasl:
+      - mechanism: PLAIN
+        username: "testuser"
+        password: "testpass"
+
+output:
+  file:
+    path: "./output_plain.jsonl"
+    codec: lines
