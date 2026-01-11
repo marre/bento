@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -22,11 +21,9 @@ import (
 	"time"
 
 	"github.com/Jeffail/shutdown"
-	"github.com/golang/snappy"
-	"github.com/klauspost/compress/zstd"
-	"github.com/pierrec/lz4/v4"
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/warpstreamlabs/bento/public/service"
 	"github.com/xdg-go/scram"
@@ -42,18 +39,6 @@ const (
 	ksfFieldMaxMessageBytes = "max_message_bytes"
 )
 
-// Kafka compression codec values as defined in the Kafka protocol specification.
-// These match franz-go's internal codecType constants.
-const (
-	codecNone   int8 = 0
-	codecGzip   int8 = 1
-	codecSnappy int8 = 2
-	codecLZ4    int8 = 3
-	codecZstd   int8 = 4
-
-	// compressionCodecMask extracts the compression codec from the lower 3 bits of the Attributes field
-	compressionCodecMask = 0x07
-)
 
 // Server configuration constants
 const (
@@ -227,6 +212,9 @@ type kafkaServerInput struct {
 
 	// Connection tracking for structured logging
 	connCounter atomic.Uint64 // Generates unique connection IDs
+
+	// Decompressor for processing compressed message batches
+	decompressor kgo.Decompressor
 }
 
 type messageBatch struct {
@@ -294,9 +282,10 @@ func generateSCRAMCredentials(mechanism, password string) (scram.StoredCredentia
 
 func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) (*kafkaServerInput, error) {
 	k := &kafkaServerInput{
-		logger:     mgr.Logger(),
-		shutdownCh: make(chan struct{}),
-		shutSig:    shutdown.NewSignaller(),
+		logger:       mgr.Logger(),
+		shutdownCh:   make(chan struct{}),
+		shutSig:      shutdown.NewSignaller(),
+		decompressor: kgo.DefaultDecompressor(),
 	}
 
 	var err error
@@ -1260,297 +1249,53 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	return k.sendResponse(conn, connID, correlationID, resp)
 }
 
-// xerialSnappyMagic is the magic header for Xerial snappy framing used by Kafka.
-// Format: 0x82 "SNAPPY" 0x00
-var xerialSnappyMagic = []byte{0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00}
-
-// decodeXerialSnappy decodes Xerial-framed snappy data (used by Kafka).
-// Format: 8-byte magic, 8-byte version info, then chunks of (4-byte size + snappy data).
-func decodeXerialSnappy(data []byte) ([]byte, error) {
-	if len(data) < 16 {
-		return nil, fmt.Errorf("xerial snappy data too short: %d bytes", len(data))
-	}
-
-	// Skip magic (8 bytes) and version info (8 bytes)
-	data = data[16:]
-
-	var result []byte
-	for len(data) > 0 {
-		if len(data) < 4 {
-			return nil, fmt.Errorf("xerial snappy: incomplete chunk size")
-		}
-		chunkSize := int(binary.BigEndian.Uint32(data))
-		data = data[4:]
-
-		if chunkSize < 0 || chunkSize > len(data) {
-			return nil, fmt.Errorf("xerial snappy: invalid chunk size %d", chunkSize)
-		}
-
-		decoded, err := snappy.Decode(nil, data[:chunkSize])
-		if err != nil {
-			return nil, fmt.Errorf("xerial snappy: failed to decode chunk: %w", err)
-		}
-		result = append(result, decoded...)
-		data = data[chunkSize:]
-	}
-	return result, nil
-}
-
-// decompressRecords decompresses Kafka record data based on the compression codec
-func decompressRecords(data []byte, codec int8) ([]byte, error) {
-	switch codec {
-	case codecNone:
-		return data, nil
-	case codecGzip:
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer reader.Close()
-		return io.ReadAll(reader)
-	case codecSnappy:
-		// Check for Xerial snappy framing (used by Kafka Java client and others)
-		if len(data) >= 8 && bytes.HasPrefix(data, xerialSnappyMagic) {
-			return decodeXerialSnappy(data)
-		}
-		// Fall back to raw snappy
-		decoded, err := snappy.Decode(nil, data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode snappy: %w", err)
-		}
-		return decoded, nil
-	case codecLZ4:
-		// Try standard LZ4 frame format first
-		reader := lz4.NewReader(bytes.NewReader(data))
-		decoded, err := io.ReadAll(reader)
-		if err != nil {
-			// Some clients use raw LZ4 blocks without frame wrapper
-			// Try block decompression as fallback
-			blockDecoded := make([]byte, 10*len(data)) // Allocate generous buffer
-			n, err2 := lz4.UncompressBlock(data, blockDecoded)
-			if err2 != nil {
-				return nil, fmt.Errorf("failed to decompress lz4 (frame: %v, block: %v)", err, err2)
-			}
-			return blockDecoded[:n], nil
-		}
-		return decoded, nil
-	case codecZstd:
-		decoder, err := zstd.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd reader: %w", err)
-		}
-		defer decoder.Close()
-		return io.ReadAll(decoder)
-	default:
-		return nil, fmt.Errorf("unsupported compression codec: %d", codec)
-	}
-}
-
+// parseRecordBatch uses kgo.ProcessFetchPartition to handle all record formats
+// (MessageSet v0, v1, and RecordBatch v2) with automatic decompression.
 func (k *kafkaServerInput) parseRecordBatch(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
-	// Check magic byte at offset 16 to determine format
-	// Offset 16 is where magic byte appears in both MessageSet and RecordBatch formats
-	// Magic 0 or 1 = legacy MessageSet format
-	// Magic 2 = v2 RecordBatch format
-	if len(data) < 17 {
-		return nil, fmt.Errorf("data too short: %d bytes", len(data))
+	if len(data) == 0 {
+		return nil, nil
 	}
 
-	magic := data[16]
-	k.logger.Debugf("[conn:%d] Record format magic byte: %d", connID, magic)
-
-	if magic < 2 {
-		// Legacy MessageSet format (magic 0 or 1)
-		return k.parseMessageSet(connID, data, topic, partition, remoteAddr)
+	// Create a FetchResponseTopicPartition with our raw records data
+	// ProcessFetchPartition handles all message formats (v0, v1, v2) and decompression
+	fakePartition := &kmsg.FetchResponseTopicPartition{
+		Partition:     partition,
+		RecordBatches: data,
 	}
 
-	// v2 RecordBatch format
-	return k.parseRecordBatchV2(connID, data, topic, partition, remoteAddr)
-}
-
-// parseMessageSet handles legacy MessageSet format (magic 0 or 1) using kmsg types
-func (k *kafkaServerInput) parseMessageSet(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
-	k.logger.Debugf("[conn:%d] Parsing legacy MessageSet format", connID)
-
-	var batch service.MessageBatch
-	offset := 0
-
-	for offset < len(data) {
-		if offset+17 > len(data) { // Minimum size: 8 (offset) + 4 (size) + 4 (crc) + 1 (magic)
-			k.logger.Debugf("[conn:%d] End of MessageSet at offset %d", connID, offset)
-			break
-		}
-
-		// Check magic byte to determine v0 or v1
-		magic := data[offset+16]
-
-		if magic == 0 {
-			// Parse as MessageV0
-			msgV0 := kmsg.NewMessageV0()
-			if err := msgV0.ReadFrom(data[offset:]); err != nil {
-				k.logger.Warnf("[conn:%d] Failed to parse MessageV0: %v", connID, err)
-				break
-			}
-
-			// Handle compression
-			compression := msgV0.Attributes & 0x07
-			if compression != 0 {
-				decompressed, err := decompressRecords(msgV0.Value, int8(compression))
-				if err != nil {
-					k.logger.Warnf("[conn:%d] Failed to decompress MessageV0: %v", connID, err)
-				} else {
-					innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
-					if err != nil {
-						k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
-					} else {
-						batch = append(batch, innerBatch...)
-					}
-				}
-			} else {
-				msg := service.NewMessage(msgV0.Value)
-				msg.MetaSetMut("kafka_server_topic", topic)
-				msg.MetaSetMut("kafka_server_partition", int(partition))
-				msg.MetaSetMut("kafka_server_offset", msgV0.Offset)
-				msg.MetaSetMut("kafka_server_tombstone_message", msgV0.Value == nil)
-				if msgV0.Key != nil {
-					msg.MetaSetMut("kafka_server_key", string(msgV0.Key))
-				}
-				msg.MetaSetMut("kafka_server_client_address", remoteAddr)
-				batch = append(batch, msg)
-			}
-
-			offset += 8 + 4 + int(msgV0.MessageSize) // Offset + MessageSize field + message content
-		} else if magic == 1 {
-			// Parse as MessageV1
-			msgV1 := kmsg.NewMessageV1()
-			if err := msgV1.ReadFrom(data[offset:]); err != nil {
-				k.logger.Warnf("[conn:%d] Failed to parse MessageV1: %v", connID, err)
-				break
-			}
-
-			// Handle compression
-			compression := msgV1.Attributes & 0x07
-			if compression != 0 {
-				decompressed, err := decompressRecords(msgV1.Value, int8(compression))
-				if err != nil {
-					k.logger.Warnf("[conn:%d] Failed to decompress MessageV1: %v", connID, err)
-				} else {
-					innerBatch, err := k.parseMessageSet(connID, decompressed, topic, partition, remoteAddr)
-					if err != nil {
-						k.logger.Warnf("[conn:%d] Failed to parse inner MessageSet: %v", connID, err)
-					} else {
-						batch = append(batch, innerBatch...)
-					}
-				}
-			} else {
-				msg := service.NewMessage(msgV1.Value)
-				msg.MetaSetMut("kafka_server_topic", topic)
-				msg.MetaSetMut("kafka_server_partition", int(partition))
-				msg.MetaSetMut("kafka_server_offset", msgV1.Offset)
-				msg.MetaSetMut("kafka_server_tombstone_message", msgV1.Value == nil)
-				if msgV1.Key != nil {
-					msg.MetaSetMut("kafka_server_key", string(msgV1.Key))
-				}
-				timestampTime := time.Unix(msgV1.Timestamp/1000, (msgV1.Timestamp%1000)*1000000)
-				msg.MetaSetMut("kafka_server_timestamp_unix", timestampTime.Unix())
-				msg.MetaSetMut("kafka_server_timestamp", timestampTime.Format(time.RFC3339))
-				msg.MetaSetMut("kafka_server_client_address", remoteAddr)
-				batch = append(batch, msg)
-			}
-
-			offset += 8 + 4 + int(msgV1.MessageSize) // Offset + MessageSize field + message content
-		} else {
-			k.logger.Warnf("[conn:%d] Unexpected magic byte %d in MessageSet", connID, magic)
-			break
-		}
+	opts := kgo.ProcessFetchPartitionOpts{
+		Topic:                topic,
+		Partition:            partition,
+		KeepControlRecords:   false,
+		DisableCRCValidation: true, // We don't need to validate CRC for incoming data
 	}
 
-	k.logger.Debugf("[conn:%d] Parsed %d messages from MessageSet", connID, len(batch))
-	return batch, nil
-}
+	// ProcessFetchPartition returns parsed records
+	fp, _ := kgo.ProcessFetchPartition(opts, fakePartition, k.decompressor, nil)
 
-// parseRecordBatchV2 handles v2 RecordBatch format (magic 2)
-func (k *kafkaServerInput) parseRecordBatchV2(connID uint64, data []byte, topic string, partition int32, remoteAddr string) (service.MessageBatch, error) {
-	// Use kmsg.RecordBatch to parse the batch header
-	recordBatch := kmsg.RecordBatch{}
-
-	err := recordBatch.ReadFrom(data)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse record batch: %w", err)
+	if fp.Err != nil {
+		return nil, fmt.Errorf("failed to process records: %w", fp.Err)
 	}
 
-	k.logger.Debugf("[conn:%d] RecordBatch has %d records, Attributes=0x%x, Records len=%d", connID, recordBatch.NumRecords, recordBatch.Attributes, len(recordBatch.Records))
-
-	// Check for compression (lower 3 bits of Attributes)
-	compression := int8(recordBatch.Attributes & compressionCodecMask)
-
-	// Decompress records if needed
-	recordsData := recordBatch.Records
-	if compression != codecNone {
-		k.logger.Debugf("[conn:%d] Decompressing records with codec %d", connID, compression)
-		decompressed, err := decompressRecords(recordsData, compression)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decompress records: %w", err)
-		}
-		recordsData = decompressed
-		k.logger.Debugf("[conn:%d] Decompressed %d bytes to %d bytes", connID, len(recordBatch.Records), len(recordsData))
-	}
-
-	// Pre-allocate batch with expected capacity
-	batch := make(service.MessageBatch, 0, recordBatch.NumRecords)
-
-	// Parse individual records from the Records byte array
-	offset := 0
-
-	for i := 0; i < int(recordBatch.NumRecords); i++ {
-		k.logger.Debugf("[conn:%d] Parsing record %d/%d, offset=%d, recordsDataLen=%d", connID, i+1, recordBatch.NumRecords, offset, len(recordsData))
-		if offset >= len(recordsData) {
-			k.logger.Warnf("[conn:%d] Reached end of data while parsing record %d/%d", connID, i, recordBatch.NumRecords)
-			break
-		}
-
-		// Parse the record - ReadFrom expects data that INCLUDES the length varint
-		record := kmsg.NewRecord()
-		k.logger.Debugf("[conn:%d] Parsing record %d from offset %d", connID, i, offset)
-
-		recordErr := record.ReadFrom(recordsData[offset:])
-
-		if recordErr != nil {
-			k.logger.Warnf("[conn:%d] Failed to parse record %d: %v", connID, i, recordErr)
-			// Cannot reliably skip this record since the length is unknown
-			break
-		}
-
-		// Calculate how many bytes the record consumed: length varint + record data
-		// The record.Length field contains the length of data AFTER the varint
-		recordLen32, lenBytesConsumed := kbin.Varint(recordsData[offset:])
-		if lenBytesConsumed == 0 {
-			k.logger.Warnf("[conn:%d] Failed to read varint length for record %d after parsing", connID, i)
-			break
-		}
-		totalBytesConsumed := lenBytesConsumed + int(recordLen32)
-		k.logger.Debugf("[conn:%d] Record %d consumed %d bytes (varint: %d, data: %d)", connID, i, totalBytesConsumed, lenBytesConsumed, recordLen32)
-
-		offset += totalBytesConsumed
-
-		// Calculate absolute timestamp
-		timestamp := recordBatch.FirstTimestamp + record.TimestampDelta64
-		timestampTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
-
-		// Create Bento message
+	// Convert kgo.Record to service.Message
+	batch := make(service.MessageBatch, 0, len(fp.Records))
+	for _, record := range fp.Records {
 		msg := service.NewMessage(record.Value)
-		msg.MetaSetMut("kafka_server_topic", topic)
-		msg.MetaSetMut("kafka_server_partition", int(partition)) // Convert to int for consistency with franz input
-		msg.MetaSetMut("kafka_server_offset", recordBatch.FirstOffset+int64(record.OffsetDelta))
+		msg.MetaSetMut("kafka_server_topic", record.Topic)
+		msg.MetaSetMut("kafka_server_partition", int(record.Partition))
+		msg.MetaSetMut("kafka_server_offset", record.Offset)
 		msg.MetaSetMut("kafka_server_tombstone_message", record.Value == nil)
 
 		if record.Key != nil {
 			msg.MetaSetMut("kafka_server_key", string(record.Key))
 		}
 
-		msg.MetaSetMut("kafka_server_timestamp_unix", timestampTime.Unix())
-		msg.MetaSetMut("kafka_server_timestamp", timestampTime.Format(time.RFC3339))
-		msg.MetaSetMut("kafka_server_remote_addr", remoteAddr)
+		if !record.Timestamp.IsZero() {
+			msg.MetaSetMut("kafka_server_timestamp_unix", record.Timestamp.Unix())
+			msg.MetaSetMut("kafka_server_timestamp", record.Timestamp.Format(time.RFC3339))
+		}
+
+		msg.MetaSetMut("kafka_server_client_address", remoteAddr)
 
 		// Add record headers as metadata
 		for _, header := range record.Headers {
@@ -1560,6 +1305,7 @@ func (k *kafkaServerInput) parseRecordBatchV2(connID uint64, data []byte, topic 
 		batch = append(batch, msg)
 	}
 
+	k.logger.Debugf("[conn:%d] Parsed %d records", connID, len(batch))
 	return batch, nil
 }
 
