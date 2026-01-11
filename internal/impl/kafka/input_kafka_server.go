@@ -492,9 +492,11 @@ func (k *kafkaServerInput) acceptLoop() {
 
 // connectionState tracks per-connection authentication state
 type connectionState struct {
-	authenticated     bool
-	scramConversation *scram.ServerConversation // For SCRAM multi-step auth
-	scramMechanism    string                    // Which SCRAM mechanism is being used
+	authenticated        bool
+	scramConversation    *scram.ServerConversation // For SCRAM multi-step auth
+	scramMechanism       string                    // Which SCRAM mechanism is being used
+	saslHandshakeVersion int16                     // Version of SaslHandshake used (0 = legacy unframed, 1 = framed)
+	expectUnframedSASL   bool                      // True if next bytes should be legacy unframed SASL
 }
 
 // saslAuthenticator defines the interface for SASL authentication handlers.
@@ -552,6 +554,50 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 				}
 			}
 			return
+		}
+
+		// Check if we're expecting legacy unframed SASL data (after SaslHandshake v0)
+		if connState.expectUnframedSASL {
+			k.logger.Debugf("[conn:%d] Handling legacy unframed SASL %s (size=%d)", connID, connState.scramMechanism, size)
+
+			// Validate size for SASL payload
+			if size <= 0 || size > 10000 { // SASL payloads should be small
+				k.logger.Errorf("[conn:%d] Invalid unframed SASL size: %d", connID, size)
+				return
+			}
+
+			// Read raw SASL bytes
+			saslData := make([]byte, size)
+			if _, err := io.ReadFull(conn, saslData); err != nil {
+				k.logger.Errorf("[conn:%d] Failed to read unframed SASL data: %v", connID, err)
+				return
+			}
+
+			// Handle legacy unframed SASL authentication based on mechanism
+			var authenticated bool
+			var err error
+			switch connState.scramMechanism {
+			case saslMechanismPlain:
+				connState.expectUnframedSASL = false // PLAIN is single-step
+				authenticated, err = k.handleUnframedSaslPlain(conn, connID, saslData, connState)
+			case saslMechanismScramSha256, saslMechanismScramSha512:
+				// SCRAM is multi-step, so keep expectUnframedSASL=true until done
+				authenticated, err = k.handleUnframedSaslScram(conn, connID, saslData, connState)
+			default:
+				k.logger.Errorf("[conn:%d] Unknown mechanism for unframed SASL: %s", connID, connState.scramMechanism)
+				return
+			}
+
+			if err != nil {
+				k.logger.Errorf("[conn:%d] Legacy SASL %s authentication error: %v", connID, connState.scramMechanism, err)
+				return
+			}
+			if authenticated {
+				connState.authenticated = true
+				connState.expectUnframedSASL = false // Done with auth
+				k.logger.Infof("[conn:%d] Client authenticated successfully (legacy SASL %s)", connID, connState.scramMechanism)
+			}
+			continue
 		}
 
 		// Request size should not exceed maxMessageBytes * requestSizeMultiplier (to account for protocol overhead)
@@ -763,10 +809,18 @@ func (k *kafkaServerInput) handleSaslHandshake(conn net.Conn, connID uint64, cor
 	}
 
 	if supported {
-		k.logger.Debugf("[conn:%d] SASL mechanism %s accepted", connID, req.Mechanism)
+		k.logger.Debugf("[conn:%d] SASL mechanism %s accepted (handshake v%d)", connID, req.Mechanism, apiVersion)
 		resp.ErrorCode = 0
-		// Store the mechanism for this connection
+		// Store the mechanism and handshake version for this connection
 		connState.scramMechanism = req.Mechanism
+		connState.saslHandshakeVersion = apiVersion
+
+		// For SaslHandshake v0, the client will send legacy unframed SASL bytes
+		// (not a SaslAuthenticate request). This applies to ALL SASL mechanisms.
+		if apiVersion == 0 {
+			connState.expectUnframedSASL = true
+			k.logger.Debugf("[conn:%d] Expecting legacy unframed SASL %s authentication", connID, req.Mechanism)
+		}
 	} else {
 		k.logger.Warnf("[conn:%d] Unsupported SASL mechanism requested: %s", connID, req.Mechanism)
 		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
@@ -979,6 +1033,115 @@ func (k *kafkaServerInput) validatePlain(connID uint64, authBytes []byte) bool {
 
 	k.logger.Debugf("[conn:%d] Credentials validated successfully for user: %s", connID, username)
 	return true
+}
+
+// handleUnframedSaslPlain handles legacy unframed SASL PLAIN authentication.
+// This is used when the client sends SaslHandshake v0, after which raw SASL
+// bytes are exchanged instead of SaslAuthenticate requests.
+//
+// Legacy SASL format:
+//   - Request:  [4-byte length][raw SASL bytes: \x00authzid\x00username\x00password]
+//   - Response: [4-byte length][outcome bytes] - for PLAIN success, outcome is empty
+func (k *kafkaServerInput) handleUnframedSaslPlain(conn net.Conn, connID uint64, saslData []byte, connState *connectionState) (bool, error) {
+	k.logger.Debugf("[conn:%d] Processing unframed SASL PLAIN: %d bytes", connID, len(saslData))
+
+	// Validate credentials using existing PLAIN validation
+	authenticated := k.validatePlain(connID, saslData)
+
+	// Send unframed response
+	// For success: [0x00 0x00 0x00 0x00] (4-byte size = 0, empty outcome)
+	// For failure: close connection (standard Kafka behavior)
+	if !authenticated {
+		k.logger.Warnf("[conn:%d] Legacy SASL PLAIN authentication failed", connID)
+		// Send error response before closing
+		// The format is [4-byte size][outcome] but for failures we can just close
+		return false, fmt.Errorf("authentication failed")
+	}
+
+	// Send success response: 4-byte size (0) indicating empty outcome
+	k.logger.Debugf("[conn:%d] Legacy SASL PLAIN authentication succeeded, sending success response", connID)
+	if err := conn.SetWriteDeadline(time.Now().Add(k.timeout)); err != nil {
+		return false, fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	// Write 4-byte size = 0 (empty outcome for PLAIN success)
+	successResp := []byte{0x00, 0x00, 0x00, 0x00}
+	if _, err := conn.Write(successResp); err != nil {
+		return false, fmt.Errorf("failed to write SASL success response: %w", err)
+	}
+
+	return true, nil
+}
+
+// handleUnframedSaslScram handles legacy unframed SCRAM authentication.
+// SCRAM is multi-step:
+// 1. Client sends client-first message
+// 2. Server responds with server-first message
+// 3. Client sends client-final message
+// 4. Server responds with server-final message (authentication complete)
+//
+// Legacy SASL format:
+//   - Request:  [4-byte length][raw SASL bytes]
+//   - Response: [4-byte length][outcome bytes]
+func (k *kafkaServerInput) handleUnframedSaslScram(conn net.Conn, connID uint64, saslData []byte, connState *connectionState) (bool, error) {
+	k.logger.Debugf("[conn:%d] Processing unframed SASL SCRAM %s: %d bytes", connID, connState.scramMechanism, len(saslData))
+
+	clientMessage := string(saslData)
+	k.logger.Debugf("[conn:%d] SCRAM client message: %s", connID, clientMessage)
+
+	// If this is the first message (no conversation yet), create one
+	if connState.scramConversation == nil {
+		k.logger.Debugf("[conn:%d] Starting unframed SCRAM conversation for mechanism: %s", connID, connState.scramMechanism)
+
+		credLookup := k.getCredentialLookup(connID, connState.scramMechanism)
+		scramServer, err := newSCRAMServer(connState.scramMechanism, credLookup)
+		if err != nil {
+			k.logger.Errorf("[conn:%d] Failed to create SCRAM server: %v", connID, err)
+			return false, fmt.Errorf("failed to create SCRAM server: %w", err)
+		}
+
+		// Start new conversation
+		connState.scramConversation = scramServer.NewConversation()
+	}
+
+	// Process the client message
+	serverMessage, err := connState.scramConversation.Step(clientMessage)
+	if err != nil {
+		k.logger.Errorf("[conn:%d] SCRAM conversation step failed: %v", connID, err)
+		return false, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	k.logger.Debugf("[conn:%d] SCRAM server response: %s", connID, serverMessage)
+
+	// Send server response as unframed SASL
+	if err := conn.SetWriteDeadline(time.Now().Add(k.timeout)); err != nil {
+		return false, fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	// Write [4-byte length][server message]
+	respBytes := []byte(serverMessage)
+	if err := binary.Write(conn, binary.BigEndian, int32(len(respBytes))); err != nil {
+		return false, fmt.Errorf("failed to write SCRAM response size: %w", err)
+	}
+	if _, err := conn.Write(respBytes); err != nil {
+		return false, fmt.Errorf("failed to write SCRAM response: %w", err)
+	}
+
+	k.logger.Debugf("[conn:%d] Sent SCRAM response: %d bytes", connID, len(respBytes))
+
+	// Check if conversation is complete
+	if connState.scramConversation.Done() {
+		if connState.scramConversation.Valid() {
+			k.logger.Debugf("[conn:%d] SCRAM authentication succeeded (unframed)", connID)
+			return true, nil
+		}
+		k.logger.Warnf("[conn:%d] SCRAM authentication failed: invalid credentials", connID)
+		return false, fmt.Errorf("invalid credentials")
+	}
+
+	// Conversation continues (need more steps)
+	k.logger.Debugf("[conn:%d] SCRAM conversation continues", connID)
+	return false, nil
 }
 
 func (k *kafkaServerInput) handleApiVersionsReq(conn net.Conn, connID uint64, correlationID int32, req *kmsg.ApiVersionsRequest, resp *kmsg.ApiVersionsResponse) error {
