@@ -1,0 +1,17 @@
+# Bento config - kafka_server with SASL SCRAM-SHA-256 authentication (debug mode)
+logger:
+  level: DEBUG
+
+input:
+  kafka_server:
+    address: "127.0.0.1:19402"
+    timeout: "10s"
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: "scramuser"
+        password: "scrampass"
+
+output:
+  file:
+    path: "./output_scram_debug.jsonl"
+    codec: lines

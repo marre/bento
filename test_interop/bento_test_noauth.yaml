@@ -1,0 +1,10 @@
+# Bento config for no-auth test on port 19200
+input:
+  kafka_server:
+    address: "127.0.0.1:19200"
+    timeout: "10s"
+
+output:
+  file:
+    path: "./output_noauth.jsonl"
+    codec: lines

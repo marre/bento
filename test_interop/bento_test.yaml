@@ -1,0 +1,10 @@
+# Bento config for clean test
+input:
+  kafka_server:
+    address: "127.0.0.1:19300"
+    timeout: "10s"
+
+output:
+  file:
+    path: "./output_test.jsonl"
+    codec: lines
