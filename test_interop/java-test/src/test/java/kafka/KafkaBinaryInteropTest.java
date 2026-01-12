@@ -278,7 +278,7 @@ public class KafkaBinaryInteropTest {
 
             ProducerRecord<byte[], byte[]> record = new ProducerRecord<>("binary-headers-topic", key, value);
             record.headers().add(new RecordHeader("content-type", "application/octet-stream".getBytes()));
-            record.headers().add(new RecordHeader("binary-header", new byte[] {0xDE, 0xAD, 0xBE, 0xEF}));
+            record.headers().add(new RecordHeader("binary-header", new byte[] {(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF}));
 
             RecordMetadata metadata = producer.send(record).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
