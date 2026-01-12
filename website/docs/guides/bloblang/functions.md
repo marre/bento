@@ -513,6 +513,56 @@ root.headers.traceparent = tracing_span().traceparent
 
 ## Environment
 
+### `cache_add`
+
+:::caution EXPERIMENTAL
+This function is experimental and therefore breaking changes could be made to it outside of major version releases.
+:::
+Set a key in the cache resource to a value. If the key already exists the action fails with a 'key already exists' error.
+
+#### Parameters
+
+**`resource`** &lt;string&gt; The name of the `cache` resource to target.  
+**`key`** &lt;string&gt; A key to use with the `cache`.  
+**`value`** &lt;string&gt; A value to use with the `cache`.  
+
+### `cache_delete`
+
+:::caution EXPERIMENTAL
+This function is experimental and therefore breaking changes could be made to it outside of major version releases.
+:::
+Delete a key and its contents from the cache. If the key does not exist the action is a no-op and will not fail with an error.
+
+#### Parameters
+
+**`resource`** &lt;string&gt; The name of the `cache` resource to target.  
+**`key`** &lt;string&gt; A key to use with the `cache`.  
+
+### `cache_get`
+
+:::caution EXPERIMENTAL
+This function is experimental and therefore breaking changes could be made to it outside of major version releases.
+:::
+Used to retrieve a cached value from a cache resource.
+
+#### Parameters
+
+**`resource`** &lt;string&gt; The name of the `cache` resource to target.  
+**`key`** &lt;string&gt; The key of the value to retrieve from the `cache` resource.  
+
+### `cache_set`
+
+:::caution EXPERIMENTAL
+This function is experimental and therefore breaking changes could be made to it outside of major version releases.
+:::
+Set a key in the cache resource to a value. If the key already exists the contents are overridden.
+
+#### Parameters
+
+**`resource`** &lt;string&gt; The name of the `cache` resource to target.  
+**`key`** &lt;string&gt; A key to use with the `cache`.  
+**`value`** &lt;string&gt; A value to use with the `cache`.  
+
 ### `env`
 
 Returns the value of an environment variable, or `null` if the environment variable does not exist.
@@ -590,6 +640,24 @@ When the path parameter is static this function will only read the specified fil
 
 ```coffee
 root.doc = file_rel(path: env("BENTO_TEST_BLOBLANG_FILE"), no_cache: true).parse_json()
+
+# In:  {}
+# Out: {"doc":{"foo":"bar"}}
+```
+
+### `file_rel_json`
+
+Reads a JSON file and returns the parsed object. The file is read and parsed only once, with the result cached for all subsequent calls. Relative paths are resolved from the directory of the mapping. This is significantly more efficient than `file_rel().parse_json()` which parses the JSON on every invocation.
+
+#### Parameters
+
+**`path`** &lt;string&gt; The path of the target JSON file.  
+
+#### Examples
+
+
+```coffee
+root.doc = file_rel_json(env("BENTO_TEST_BLOBLANG_FILE"))
 
 # In:  {}
 # Out: {"doc":{"foo":"bar"}}

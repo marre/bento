@@ -3,6 +3,54 @@ Changelog
 
 All notable changes to this project will be documented in this file.
 
+## 1.14.0 - 2026-01-02
+
+### Fixed
+
+- reconnect logic for `mongodb` output @mladBlum
+
+### Added
+
+- `parquet_encode` processor now includes support for native Struct types @triddell
+- `file_rel_json` bloblang function which loads, parses & caches JSON files @triddell
+- `ttl` field to `couchbase` processor enabling optional setting of TTL for couchbase items @sapk
+- `LeveledLogger` interface added to service package enabling simpler use of custom loggers @gregfurman
+- `opensnowcat` processor includes `enriched_json` option for `output_format` @joaolcorreia
+- `RegisterManagedConstructor` added enabling registration of initialisation functions with access to service resources @gregfurman
+- `cache_get`, `cache_set`, `cache_delete` & `cache_add` bloblang functions (made possible by `RegisterManagedConstructor`) @gregfurman
+- `couchbase` increment & decrement operations @sapk
+- `new_root_span_with_link` field added to various `kafka` & `nats` components @gregfurman 
+- `expiry_window` added to AWS `credentials` config allowing the credentials to trigger refreshing prior to the credentials actually expiring @gitphill
+- `grpc_client` output component @jem-davies
+
+## 1.13.1 - 2025-12-04
+
+### Fixed 
+
+- `parquet_encode` processor adds safeguard for schema fields beginning with non-alphabetic characters @gregfurman
+
+## 1.13.0 - 2025-12-02
+
+### Added 
+
+- `allow_headers` & `allow_methods` to cors config for `http_server` @jem-davies
+- `transport` field exposes options to enable custom http transports with `http` components & `schema_registry_encode/decode` components @jem-davies
+- `slack_webhook` output publishes messages to Slack via webhook @bhataprameya
+- `memory` buffer includes 'spillover' and 'active' metrics to track: bytes dropped and bytes in the buffer @alecmerdler 
+- `auth_secret` field added to `nsq` input & output enables connection with authentication @danrjohnson
+- new input `azure_service_bus_queue` with azure default credentials support @adrianhaj
+- `spillover` field to `memory` cache allows option of dropping incoming messages that would exceed the cache limit @alecmerdler
+
+### Changed
+
+- ServiceBuilder API now logs lint warnings @jem-davies
+- upgrade sarama dependency for `kafka` components @gitphill
+
+### Fixed
+
+- `aws_kinesis` input now properly handles pagination over kinesis shards @gregfurman
+- sql outputs reconnect logic avoids race condition @gregfurman
+
 ## 1.12.1 - 2025-10-24
 
 ### Fixed 
