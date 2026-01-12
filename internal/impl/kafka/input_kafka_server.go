@@ -1301,12 +1301,14 @@ func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int
 
 func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remoteAddr string, correlationID int32, req *kmsg.ProduceRequest, resp *kmsg.ProduceResponse) error {
 	k.logger.Infof("[conn:%d] Produce request: correlationID=%d, acks=%d, topics=%d", connID, correlationID, req.Acks, len(req.Topics))
+	k.logger.Infof("[conn:%d] Starting to process produce request", connID)
 
 	// Create context with timeout for this request
 	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
 	defer cancel()
 
 	var batch service.MessageBatch
+	k.logger.Infof("[conn:%d] Created batch, iterating through %d topics", connID, len(req.Topics))
 
 	// Iterate through topics using kmsg's typed structures
 	for _, topic := range req.Topics {
@@ -1353,17 +1355,17 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		}
 	}
 
-	k.logger.Debugf("[conn:%d] Total batch size: %d messages", connID, len(batch))
+	k.logger.Infof("[conn:%d] Finished iterating topics, total batch size: %d messages", connID, len(batch))
 	// If no messages, still need to build response for all requested topics/partitions
 	if len(batch) == 0 {
-		k.logger.Debugf("[conn:%d] No messages to process, building success response", connID)
+		k.logger.Infof("[conn:%d] No messages to process, building success response", connID)
 		resp.Topics = buildProduceResponseTopics(req.Topics, 0)
 		return k.sendResponse(conn, connID, correlationID, resp)
 	}
 
 	// Send batch to pipeline
 	resChan := make(chan error, 1)
-	k.logger.Debugf("[conn:%d] Sending batch to pipeline, acks=%d", connID, req.Acks)
+	k.logger.Debugf("[conn:%d] Sending batch to pipeline, acks=%d, batch_size=%d", connID, req.Acks, len(batch))
 	msgChan := k.getMsgChan()
 	if msgChan == nil {
 		k.logger.Errorf("[conn:%d] msgChan is nil, cannot send batch", connID)
@@ -1373,7 +1375,12 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	case msgChan <- messageBatch{
 		batch: batch,
 		ackFn: func(ackCtx context.Context, err error) error {
-			resChan <- err
+			select {
+			case resChan <- err:
+			default:
+				// Channel full or closed, don't block
+				k.logger.Warnf("Failed to send ack result to resChan")
+			}
 			return nil
 		},
 		resChan: resChan,
@@ -1387,28 +1394,39 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		return fmt.Errorf("shutting down")
 	}
 
-	// Wait for acknowledgment if acks != 0 (acks can be -1 for "all", 1 for "leader")
-	k.logger.Debugf("[conn:%d] Checking acks: req.Acks=%d", connID, req.Acks)
-	if req.Acks != 0 {
-		k.logger.Debugf("[conn:%d] Waiting for acknowledgment (acks != 0)", connID)
-		select {
-		case err := <-resChan:
-			errorCode := int16(0)
-			if err != nil {
-				errorCode = kerr.UnknownServerError.Code
-			}
-			resp.Topics = buildProduceResponseTopics(req.Topics, errorCode)
-		case <-ctx.Done():
-			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
-		case <-k.shutdownCh:
-			return fmt.Errorf("shutting down")
-		}
-	} else {
-		// When acks=0, don't wait for acknowledgment but still build response
+	// For Kafka protocol semantics:
+	// - acks=0: Don't wait for any acknowledgment (fire and forget)
+	// - acks=1 or acks=all (-1): Wait for the pipeline to process the message
+	//
+	// For proper backpressure, we wait for the pipeline to acknowledge processing
+	// before responding to the producer. This ensures that if the output is slow,
+	// the producer will slow down accordingly.
+	if req.Acks == 0 {
+		// acks=0: fire and forget - respond immediately without waiting
 		k.logger.Debugf("[conn:%d] acks=0, sending immediate success response", connID)
 		resp.Topics = buildProduceResponseTopics(req.Topics, 0)
+		return k.sendResponse(conn, connID, correlationID, resp)
 	}
 
+	// acks=1 or acks=all: wait for pipeline acknowledgment before responding
+	k.logger.Debugf("[conn:%d] Waiting for pipeline acknowledgment (acks=%d)", connID, req.Acks)
+	select {
+	case ackErr := <-resChan:
+		if ackErr != nil {
+			k.logger.Warnf("[conn:%d] Pipeline returned error: %v", connID, ackErr)
+			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.UnknownServerError.Code)
+		} else {
+			k.logger.Debugf("[conn:%d] Pipeline acknowledged successfully", connID)
+			resp.Topics = buildProduceResponseTopics(req.Topics, 0)
+		}
+	case <-ctx.Done():
+		k.logger.Warnf("[conn:%d] Timeout waiting for pipeline acknowledgment", connID)
+		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
+	case <-k.shutdownCh:
+		return fmt.Errorf("shutting down")
+	}
+
+	k.logger.Debugf("[conn:%d] Sending produce response, topics=%d", connID, len(resp.Topics))
 	return k.sendResponse(conn, connID, correlationID, resp)
 }
 

@@ -322,7 +322,8 @@ public class KafkaServerInteropTest {
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ACKS_CONFIG, "1"); // Use acks=1 instead of all
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false); // Disable idempotence (requires INIT_PRODUCER_ID)
         props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000);
         props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 15000);
         props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 10000);
