@@ -51,6 +51,41 @@ const (
 	maxClientIDLength = 10000
 )
 
+// saslServerField returns the SASL configuration field for the kafka_server input.
+// This is different from the client-side saslField() as it only supports mechanisms
+// that can be validated server-side (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
+func saslServerField() *service.ConfigField {
+	return service.NewObjectListField(ksfFieldSASL,
+		service.NewStringAnnotatedEnumField("mechanism", map[string]string{
+			"PLAIN":         "Plain text authentication. Credentials are sent in clear text, so TLS is recommended.",
+			"SCRAM-SHA-256": "SCRAM based authentication as specified in RFC5802.",
+			"SCRAM-SHA-512": "SCRAM based authentication as specified in RFC5802.",
+		}).
+			Description("The SASL mechanism to use for this credential."),
+		service.NewStringField("username").
+			Description("The username for authentication."),
+		service.NewStringField("password").
+			Description("The password for authentication.").
+			Secret(),
+	).
+		Description("Configure one or more SASL credentials that clients can use to authenticate. When SASL is configured, clients must authenticate before sending produce requests. Multiple credentials can be configured for the same or different mechanisms.").
+		Advanced().Optional().
+		Example(
+			[]any{
+				map[string]any{
+					"mechanism": "PLAIN",
+					"username":  "user1",
+					"password":  "password1",
+				},
+				map[string]any{
+					"mechanism": "SCRAM-SHA-256",
+					"username":  "user2",
+					"password":  "password2",
+				},
+			},
+		)
+}
+
 func kafkaServerInputConfig() *service.ConfigSpec {
 	return service.NewConfigSpec().
 		Version("1.0.0").
@@ -88,14 +123,14 @@ Message headers from Kafka records are also added as metadata fields.`).
 			Default([]string{}).
 			Advanced()).
 		Field(service.NewTLSToggledField(ksfFieldTLS)).
-		Field(saslField()).
+		Field(saslServerField()).
 		Field(service.NewDurationField(ksfFieldTimeout).
-			Description("The maximum time to wait for a message to be processed before responding with an error.").
+			Description("The maximum time to wait for a produce request to be processed by the pipeline and acknowledged. This timeout also applies to write operations when sending responses back to clients. If processing takes longer than this duration, the producer receives a timeout error, but the message may still be delivered to the pipeline.").
 			Default("5s").
 			Advanced()).
 		Field(service.NewDurationField(ksfFieldIdleTimeout).
 			Description("The maximum time a connection can be idle (no data received) before being closed. Use a larger value for producers that send infrequently. Set to 0 to disable idle timeout.").
-			Default("5m").
+			Default("0").
 			Advanced()).
 		Field(service.NewIntField(ksfFieldMaxMessageBytes).
 			Description("The maximum size in bytes of a message payload.").
@@ -105,7 +140,7 @@ Message headers from Kafka records are also added as metadata fields.`).
 			Description("Enable support for idempotent Kafka producers. When enabled, the server will respond to InitProducerID requests and allocate producer IDs. Note: This enables clients to use idempotent producers but does NOT provide actual exactly-once semantics - it only satisfies the protocol requirements.").
 			Default(false).
 			Advanced()).
-		Example("Basic Usage", "Accept Kafka produce requests and write to S3", `
+		Example("Basic Usage", "Accept Kafka produce requests and write to stdout", `
 input:
   kafka_server:
     address: "0.0.0.0:9092"
@@ -114,9 +149,7 @@ input:
       - logs
 
 output:
-  aws_s3:
-    bucket: my-data-lake
-    path: '${! meta("kafka_server_topic") }/${! timestamp_unix() }.json'
+  stdout: {}
 `).
 		Example("With TLS", "Accept Kafka produce requests over TLS", `
 input:
@@ -487,14 +520,19 @@ func (k *kafkaServerInput) handleConnection(conn net.Conn) {
 		}
 
 		// Use idleTimeout for waiting on new data (can be long for quiet producers)
-		// Use timeout for active read operations (should be shorter)
-		readDeadline := k.timeout
+		// If idleTimeout is 0, wait indefinitely (no deadline) - only client disconnect will stop
+		// Otherwise use idleTimeout as the read deadline
 		if k.idleTimeout > 0 {
-			readDeadline = k.idleTimeout
-		}
-		if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-			k.logger.Errorf("[conn:%d] Failed to set read deadline: %v", connID, err)
-			return
+			if err := conn.SetReadDeadline(time.Now().Add(k.idleTimeout)); err != nil {
+				k.logger.Errorf("[conn:%d] Failed to set read deadline: %v", connID, err)
+				return
+			}
+		} else {
+			// Clear any previous deadline - wait forever for data
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				k.logger.Errorf("[conn:%d] Failed to clear read deadline: %v", connID, err)
+				return
+			}
 		}
 
 		// First, try to peek at the connection to see if any data is available
