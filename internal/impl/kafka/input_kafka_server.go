@@ -88,8 +88,8 @@ func saslServerField() *service.ConfigField {
 
 func kafkaServerInputConfig() *service.ConfigSpec {
 	return service.NewConfigSpec().
-		Version("1.0.0").
-		Stable().
+		Version("1.15.0").
+		Beta().
 		Categories("Services").
 		Summary("Runs a Kafka-protocol-compatible server that accepts produce requests from Kafka producers.").
 		Description(`
@@ -110,7 +110,9 @@ This input adds the following metadata fields to each message:
 - kafka_server_client_address
 `+"```"+`
 
-Message headers from Kafka records are also added as metadata fields.`).
+Message headers from Kafka records are also added as metadata fields.
+
+You can access these metadata fields using [function interpolation](/docs/configuration/interpolation#bloblang-queries).`).
 		Field(service.NewStringField(ksfFieldAddress).
 			Description("The address to listen on for Kafka protocol connections.").
 			Default("0.0.0.0:9092")).
@@ -157,8 +159,9 @@ input:
     address: "0.0.0.0:9093"
     tls:
       enabled: true
-      cert_file: /path/to/cert.pem
-      key_file: /path/to/key.pem
+      client_certs:
+        - cert_file: /path/to/cert.pem
+          key_file: /path/to/key.pem
 `).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
@@ -166,8 +169,9 @@ input:
     address: "0.0.0.0:9092"
     tls:
       enabled: true
-      cert_file: /path/to/cert.pem
-      key_file: /path/to/key.pem
+      client_certs:
+        - cert_file: /path/to/cert.pem
+          key_file: /path/to/key.pem
     sasl:
       - mechanism: PLAIN
         username: producer1
@@ -182,8 +186,9 @@ input:
     address: "0.0.0.0:9092"
     tls:
       enabled: true
-      cert_file: /path/to/cert.pem
-      key_file: /path/to/key.pem
+      client_certs:
+        - cert_file: /path/to/cert.pem
+          key_file: /path/to/key.pem
     sasl:
       - mechanism: SCRAM-SHA-256
         username: producer1
