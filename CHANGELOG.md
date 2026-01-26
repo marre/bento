@@ -3,6 +3,12 @@ Changelog
 
 All notable changes to this project will be documented in this file.
 
+## 1.15.0 - 2026-01-26
+
+### Added
+
+- new input `kafka_server` @marre
+
 ## 1.14.1 - 2026-01-12
 
 ### Fixed
