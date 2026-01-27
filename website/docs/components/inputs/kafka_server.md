@@ -58,7 +58,7 @@ input:
       client_certs: []
     sasl: [] # No default (optional)
     timeout: 5s
-    idle_timeout: 5m
+    idle_timeout: "0"
     max_message_bytes: 1048576
     idempotent_write: false
 ```
@@ -98,7 +98,7 @@ You can access these metadata fields using [function interpolation](/docs/config
 
 <TabItem value="Basic Usage">
 
-Accept Kafka produce requests and write to S3
+Accept Kafka produce requests and write to stdout
 
 ```yaml
 input:
@@ -109,9 +109,7 @@ input:
       - logs
 
 output:
-  aws_s3:
-    bucket: my-data-lake
-    path: '${! meta("kafka_server_topic") }/${! timestamp_unix() }.json'
+  stdout: {}
 ```
 
 </TabItem>
@@ -347,7 +345,7 @@ password: ${KEY_PASSWORD}
 
 ### `sasl`
 
-Specify one or more methods of SASL authentication. SASL is tried in order; if the broker supports the first mechanism, all connections will use that mechanism. If the first mechanism fails, the client will pick the first supported mechanism. If the broker does not support any client mechanisms, connections will fail.
+Configure one or more SASL credentials that clients can use to authenticate. When SASL is configured, clients must authenticate before sending produce requests. Multiple credentials can be configured for the same or different mechanisms.
 
 
 Type: `array`  
@@ -356,163 +354,48 @@ Type: `array`
 # Examples
 
 sasl:
-  - mechanism: SCRAM-SHA-512
-    password: bar
-    username: foo
+  - mechanism: PLAIN
+    password: password1
+    username: user1
+  - mechanism: SCRAM-SHA-256
+    password: password2
+    username: user2
 ```
 
 ### `sasl[].mechanism`
 
-The SASL mechanism to use.
+The SASL mechanism to use for this credential.
 
 
 Type: `string`  
 
 | Option | Summary |
 |---|---|
-| `AWS_MSK_IAM` | AWS IAM based authentication as specified by the 'aws-msk-iam-auth' java library. |
-| `OAUTHBEARER` | OAuth Bearer based authentication. |
-| `PLAIN` | Plain text authentication. |
+| `PLAIN` | Plain text authentication. Credentials are sent in clear text, so TLS is recommended. |
 | `SCRAM-SHA-256` | SCRAM based authentication as specified in RFC5802. |
 | `SCRAM-SHA-512` | SCRAM based authentication as specified in RFC5802. |
-| `none` | Disable sasl authentication |
 
 
 ### `sasl[].username`
 
-A username to provide for PLAIN or SCRAM-* authentication.
+The username for authentication.
 
 
 Type: `string`  
-Default: `""`  
 
 ### `sasl[].password`
 
-A password to provide for PLAIN or SCRAM-* authentication.
+The password for authentication.
 :::warning Secret
 This field contains sensitive information that usually shouldn't be added to a config directly, read our [secrets page for more info](/docs/configuration/secrets).
 :::
 
 
 Type: `string`  
-Default: `""`  
-
-### `sasl[].token`
-
-The token to use for a single session's OAUTHBEARER authentication.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].extensions`
-
-Key/value pairs to add to OAUTHBEARER authentication requests.
-
-
-Type: `object`  
-
-### `sasl[].aws`
-
-Contains AWS specific fields for when the `mechanism` is set to `AWS_MSK_IAM`.
-
-
-Type: `object`  
-
-### `sasl[].aws.region`
-
-The AWS region to target.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.endpoint`
-
-Allows you to specify a custom endpoint for the AWS API.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials`
-
-Optional manual configuration of AWS credentials to use. More information can be found [in this document](/docs/guides/cloud/aws).
-
-
-Type: `object`  
-
-### `sasl[].aws.credentials.profile`
-
-A profile from `~/.aws/credentials` to use.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.id`
-
-The ID of credentials to use.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.secret`
-
-The secret for the credentials being used.
-:::warning Secret
-This field contains sensitive information that usually shouldn't be added to a config directly, read our [secrets page for more info](/docs/configuration/secrets).
-:::
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.token`
-
-The token for the credentials being used, required when using short term credentials.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.from_ec2_role`
-
-Use the credentials of a host EC2 machine configured to assume [an IAM role associated with the instance](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2.html).
-
-
-Type: `bool`  
-Default: `false`  
-Requires version 1.0.0 or newer  
-
-### `sasl[].aws.credentials.role`
-
-A role ARN to assume.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.role_external_id`
-
-An external ID to provide when assuming a role.
-
-
-Type: `string`  
-Default: `""`  
-
-### `sasl[].aws.credentials.expiry_window`
-
-Allow the credentials to trigger refreshing prior to the credentials actually expiring. This is beneficial so race conditions with expiring credentials do not cause requests to fail. For example '10s' would refresh credentials ten seconds before expiration. Setting to a duration of `0` disables the expiry window.
-
-
-Type: `string`  
-Default: `""`  
 
 ### `timeout`
 
-The maximum time to wait for a message to be processed before responding with an error.
+The maximum time to wait for a produce request to be processed by the pipeline and acknowledged. This timeout also applies to write operations when sending responses back to clients. If processing takes longer than this duration, the producer receives a timeout error, but the message may still be delivered to the pipeline.
 
 
 Type: `string`  
@@ -524,7 +407,7 @@ The maximum time a connection can be idle (no data received) before being closed
 
 
 Type: `string`  
-Default: `"5m"`  
+Default: `"0"`  
 
 ### `max_message_bytes`
 
