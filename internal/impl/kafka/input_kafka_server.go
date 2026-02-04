@@ -196,9 +196,11 @@ input:
     address: "0.0.0.0:9093"
     tls:
       enabled: true
+      # Server's certificate and key (note: the TLS field is named client_certs for historical reasons)
       client_certs:
         - cert_file: /path/to/server-cert.pem
           key_file: /path/to/server-key.pem
+    # Require and verify client certificates
     mtls_auth: require_and_verify
     mtls_cas_file: /path/to/client-ca.pem
 `).
@@ -208,9 +210,11 @@ input:
     address: "0.0.0.0:9093"
     tls:
       enabled: true
+      # Server's certificate and key
       client_certs:
         - cert_file: /path/to/server-cert.pem
           key_file: /path/to/server-key.pem
+    # Verify client certificates if provided (optional)
     mtls_auth: verify_if_given
     mtls_cas_file: /path/to/client-ca.pem
 `).

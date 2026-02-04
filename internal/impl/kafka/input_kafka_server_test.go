@@ -1699,85 +1699,85 @@ mtls_auth: invalid_option
 }
 
 func TestKafkaServerInputMTLSIntegration(t *testing.T) {
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-// Create CA key and certificate
-caKey, err := rsa.GenerateKey(rand.Reader, 2048)
-require.NoError(t, err)
+	// Create CA key and certificate
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
 
-caTemplate := x509.Certificate{
-SerialNumber: big.NewInt(1),
-Subject: pkix.Name{
-Organization: []string{"Test CA"},
-CommonName:   "Test CA",
-},
-NotBefore:             time.Now(),
-NotAfter:              time.Now().Add(24 * time.Hour),
-KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-BasicConstraintsValid: true,
-IsCA:                  true,
-}
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test CA"},
+			CommonName:   "Test CA",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
 
-caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
-require.NoError(t, err)
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	require.NoError(t, err)
 
-caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
 
-// Create server key and certificate
-serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
-require.NoError(t, err)
+	// Create server key and certificate
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
 
-serverTemplate := x509.Certificate{
-SerialNumber: big.NewInt(2),
-Subject: pkix.Name{
-Organization: []string{"Test Server"},
-CommonName:   "localhost",
-},
-NotBefore:             time.Now(),
-NotAfter:              time.Now().Add(24 * time.Hour),
-KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-BasicConstraintsValid: true,
-DNSNames:              []string{"localhost"},
-IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-}
+	serverTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			Organization: []string{"Test Server"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
 
-serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
-require.NoError(t, err)
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
+	require.NoError(t, err)
 
-serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
-serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
+	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
 
-// Create client key and certificate
-clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
-require.NoError(t, err)
+	// Create client key and certificate
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
 
-clientTemplate := x509.Certificate{
-SerialNumber: big.NewInt(3),
-Subject: pkix.Name{
-Organization: []string{"Test Client"},
-CommonName:   "test-client",
-},
-NotBefore:             time.Now(),
-NotAfter:              time.Now().Add(24 * time.Hour),
-KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-BasicConstraintsValid: true,
-}
+	clientTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject: pkix.Name{
+			Organization: []string{"Test Client"},
+			CommonName:   "test-client",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
 
-clientCertDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientKey.PublicKey, caKey)
-require.NoError(t, err)
+	clientCertDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientKey.PublicKey, caKey)
+	require.NoError(t, err)
 
-clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER})
-clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
+	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER})
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
 
-// Create kafka_server input with mTLS
-spec := kafkaServerInputConfig()
-env := service.NewEnvironment()
+	// Create kafka_server input with mTLS
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
 
-config := fmt.Sprintf(`
+	config := fmt.Sprintf(`
 address: "127.0.0.1:19110"
 tls:
   enabled: true
@@ -1791,126 +1791,126 @@ mtls_cas: |
 %s
 `, indentPEM(string(serverCertPEM), 8), indentPEM(string(serverKeyPEM), 8), indentPEM(string(caCertPEM), 2))
 
-parsed, err := spec.ParseYAML(config, env)
-require.NoError(t, err)
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
 
-input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
-require.NoError(t, err)
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
 
-err = input.Connect(ctx)
-require.NoError(t, err)
-defer input.Close(ctx)
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
 
-time.Sleep(100 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
-// Test 1: Client with valid certificate should connect
-t.Run("valid_client_cert", func(t *testing.T) {
-clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
-require.NoError(t, err)
+	// Test 1: Client with valid certificate should connect
+	t.Run("valid_client_cert", func(t *testing.T) {
+		clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+		require.NoError(t, err)
 
-caCertPool := x509.NewCertPool()
-caCertPool.AppendCertsFromPEM(caCertPEM)
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCertPEM)
 
-tlsConfig := &tls.Config{
-Certificates: []tls.Certificate{clientCert},
-RootCAs:      caCertPool,
-}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{clientCert},
+			RootCAs:      caCertPool,
+		}
 
-client, err := kgo.NewClient(
-kgo.SeedBrokers("127.0.0.1:19110"),
-kgo.DialTLSConfig(tlsConfig),
-kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
-return "[CLIENT-VALID] "
-})),
-)
-require.NoError(t, err)
-defer client.Close()
+		client, err := kgo.NewClient(
+			kgo.SeedBrokers("127.0.0.1:19110"),
+			kgo.DialTLSConfig(tlsConfig),
+			kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+				return "[CLIENT-VALID] "
+			})),
+		)
+		require.NoError(t, err)
+		defer client.Close()
 
-testTopic := "test-topic-mtls"
-testValue := "test-value-mtls"
+		testTopic := "test-topic-mtls"
+		testValue := "test-value-mtls"
 
-record := &kgo.Record{
-Topic: testTopic,
-Value: []byte(testValue),
-}
+		record := &kgo.Record{
+			Topic: testTopic,
+			Value: []byte(testValue),
+		}
 
-// Use channel for synchronization
-produceChan := make(chan error, 1)
-go func() {
-results := client.ProduceSync(ctx, record)
-if len(results) > 0 {
-produceChan <- results[0].Err
-}
-}()
+		// Use channel for synchronization
+		produceChan := make(chan error, 1)
+		go func() {
+			results := client.ProduceSync(ctx, record)
+			if len(results) > 0 {
+				produceChan <- results[0].Err
+			}
+		}()
 
-// Read message from input
-batch, ackFn, err := input.ReadBatch(ctx)
-require.NoError(t, err)
-require.Len(t, batch, 1)
+		// Read message from input
+		batch, ackFn, err := input.ReadBatch(ctx)
+		require.NoError(t, err)
+		require.Len(t, batch, 1)
 
-msgBytes, err := batch[0].AsBytes()
-require.NoError(t, err)
-assert.Equal(t, testValue, string(msgBytes))
+		msgBytes, err := batch[0].AsBytes()
+		require.NoError(t, err)
+		assert.Equal(t, testValue, string(msgBytes))
 
-err = ackFn(ctx, nil)
-require.NoError(t, err)
+		err = ackFn(ctx, nil)
+		require.NoError(t, err)
 
-// Verify producer received acknowledgment
-select {
-case err := <-produceChan:
-assert.NoError(t, err)
-case <-time.After(5 * time.Second):
-t.Fatal("Timeout waiting for producer acknowledgment")
-}
-})
+		// Verify producer received acknowledgment
+		select {
+		case err := <-produceChan:
+			assert.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Timeout waiting for producer acknowledgment")
+		}
+	})
 
-// Test 2: Client without certificate should be rejected
-t.Run("no_client_cert", func(t *testing.T) {
-caCertPool := x509.NewCertPool()
-caCertPool.AppendCertsFromPEM(caCertPEM)
+	// Test 2: Client without certificate should be rejected
+	t.Run("no_client_cert", func(t *testing.T) {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCertPEM)
 
-tlsConfig := &tls.Config{
-RootCAs: caCertPool,
-}
+		tlsConfig := &tls.Config{
+			RootCAs: caCertPool,
+		}
 
-client, err := kgo.NewClient(
-kgo.SeedBrokers("127.0.0.1:19110"),
-kgo.DialTLSConfig(tlsConfig),
-kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
-return "[CLIENT-NO-CERT] "
-})),
-)
-require.NoError(t, err)
-defer client.Close()
+		client, err := kgo.NewClient(
+			kgo.SeedBrokers("127.0.0.1:19110"),
+			kgo.DialTLSConfig(tlsConfig),
+			kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+				return "[CLIENT-NO-CERT] "
+			})),
+		)
+		require.NoError(t, err)
+		defer client.Close()
 
-testTopic := "test-topic-fail"
-testValue := "should-fail"
+		testTopic := "test-topic-fail"
+		testValue := "should-fail"
 
-record := &kgo.Record{
-Topic: testTopic,
-Value: []byte(testValue),
-}
+		record := &kgo.Record{
+			Topic: testTopic,
+			Value: []byte(testValue),
+		}
 
-results := client.ProduceSync(ctx, record)
-require.Len(t, results, 1)
+		results := client.ProduceSync(ctx, record)
+		require.Len(t, results, 1)
 
-// Should get an error due to missing client certificate
-assert.Error(t, results[0].Err)
-t.Logf("Expected TLS error received: %v", results[0].Err)
-})
+		// Should get an error due to missing client certificate
+		assert.Error(t, results[0].Err)
+		t.Logf("Expected TLS error received: %v", results[0].Err)
+	})
 }
 
 // indentPEM adds indentation to each line of PEM content
 func indentPEM(pem string, spaces int) string {
-indent := ""
-for i := 0; i < spaces; i++ {
-indent += " "
-}
-lines := []string{}
-for _, line := range strings.Split(pem, "\n") {
-if line != "" {
-lines = append(lines, indent+line)
-}
-}
-return strings.Join(lines, "\n")
+	indent := ""
+	for i := 0; i < spaces; i++ {
+		indent += " "
+	}
+	lines := []string{}
+	for _, line := range strings.Split(pem, "\n") {
+		if line != "" {
+			lines = append(lines, indent+line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
