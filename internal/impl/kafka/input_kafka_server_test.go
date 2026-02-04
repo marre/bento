@@ -1609,10 +1609,13 @@ func TestKafkaServerInputMTLSConfig(t *testing.T) {
 			name: "valid mTLS config with require_and_verify",
 			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-cert_file: %s
-key_file: %s
-mtls_auth: require_and_verify
-mtls_cas_file: %s
+tls:
+  enabled: true
+  client_certs:
+    - cert_file: %s
+      key_file: %s
+  client_auth_type: require_and_verify
+  client_cas_file: %s
 `, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
@@ -1620,10 +1623,13 @@ mtls_cas_file: %s
 			name: "valid mTLS config with verify_if_given",
 			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-cert_file: %s
-key_file: %s
-mtls_auth: verify_if_given
-mtls_cas_file: %s
+tls:
+  enabled: true
+  client_certs:
+    - cert_file: %s
+      key_file: %s
+  client_auth_type: verify_if_given
+  client_cas_file: %s
 `, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
@@ -1631,36 +1637,26 @@ mtls_cas_file: %s
 			name: "valid mTLS config with request",
 			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-cert_file: %s
-key_file: %s
-mtls_auth: request
+tls:
+  enabled: true
+  client_certs:
+    - cert_file: %s
+      key_file: %s
+  client_auth_type: request
 `, certFile, keyFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
-			name: "invalid mtls_auth",
+			name: "invalid client_auth_type",
 			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-cert_file: %s
-key_file: %s
-mtls_auth: invalid_option
+tls:
+  enabled: true
+  client_certs:
+    - cert_file: %s
+      key_file: %s
+  client_auth_type: invalid_option
 `, certFile, keyFile),
-			wantErr: true,
-		},
-		{
-			name: "cert_file without key_file",
-			config: fmt.Sprintf(`
-address: "127.0.0.1:19092"
-cert_file: %s
-`, certFile),
-			wantErr: true,
-		},
-		{
-			name: "key_file without cert_file",
-			config: fmt.Sprintf(`
-address: "127.0.0.1:19092"
-key_file: %s
-`, keyFile),
 			wantErr: true,
 		},
 	}
@@ -1781,10 +1777,13 @@ func TestKafkaServerInputMTLSIntegration(t *testing.T) {
 
 	config := fmt.Sprintf(`
 address: "127.0.0.1:19110"
-cert_file: %s
-key_file: %s
-mtls_auth: require_and_verify
-mtls_cas_file: %s
+tls:
+  enabled: true
+  client_certs:
+    - cert_file: %s
+      key_file: %s
+  client_auth_type: require_and_verify
+  client_cas_file: %s
 `, serverCertFile, serverKeyFile, clientCAFile)
 
 	parsed, err := spec.ParseYAML(config, env)
