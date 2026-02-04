@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/warpstreamlabs/bento/internal/filepath/ifs"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
@@ -26,6 +28,9 @@ const (
 	ksfFieldAdvertisedAddress = "advertised_address"
 	ksfFieldTopics            = "topics"
 	ksfFieldTLS               = "tls"
+	ksfFieldMTLSAuth          = "mtls_auth"
+	ksfFieldMTLSCAs           = "mtls_cas"
+	ksfFieldMTLSCAsFile       = "mtls_cas_file"
 	ksfFieldSASL              = "sasl"
 	ksfFieldTimeout           = "timeout"
 	ksfFieldIdleTimeout       = "idle_timeout"
@@ -125,6 +130,28 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Default([]string{}).
 			Advanced()).
 		Field(service.NewTLSToggledField(ksfFieldTLS)).
+		Field(service.NewStringAnnotatedEnumField(ksfFieldMTLSAuth, map[string]string{
+			"none":                "Server will not request a client certificate",
+			"request":             "Server will request a client certificate but doesn't require the client to send one",
+			"require":             "Server will require any client certificate (doesn't verify it)",
+			"verify_if_given":     "Server will request a client certificate and verify it if provided",
+			"require_and_verify":  "Server requires a client certificate and will verify it against the mtls_cas",
+		}).
+			Description("Sets the policy the server will follow for mTLS client authentication. Only used when TLS is enabled.").
+			Default("").
+			Advanced().
+			Optional()).
+		Field(service.NewStringField(ksfFieldMTLSCAs).
+			Description("An optional PEM encoded string of client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
+			Default("").
+			Advanced().
+			Secret().
+			Optional()).
+		Field(service.NewStringField(ksfFieldMTLSCAsFile).
+			Description("An optional path to a file containing client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
+			Default("").
+			Advanced().
+			Optional()).
 		Field(saslServerField()).
 		Field(service.NewDurationField(ksfFieldTimeout).
 			Description("The maximum time to wait for a produce request to be processed by the pipeline and acknowledged. This timeout also applies to write operations when sending responses back to clients. If processing takes longer than this duration, the producer receives a timeout error, but the message may still be delivered to the pipeline.").
@@ -172,8 +199,8 @@ input:
       client_certs:
         - cert_file: /path/to/server-cert.pem
           key_file: /path/to/server-key.pem
-      client_auth_type: require_and_verify
-      client_cas_file: /path/to/client-ca.pem
+    mtls_auth: require_and_verify
+    mtls_cas_file: /path/to/client-ca.pem
 `).
 		Example("With mTLS (optional verification)", "Accept Kafka produce requests with optional client certificate verification", `
 input:
@@ -184,8 +211,8 @@ input:
       client_certs:
         - cert_file: /path/to/server-cert.pem
           key_file: /path/to/server-key.pem
-      client_auth_type: verify_if_given
-      client_cas_file: /path/to/client-ca.pem
+    mtls_auth: verify_if_given
+    mtls_cas_file: /path/to/client-ca.pem
 `).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
@@ -328,6 +355,73 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 	}
 	if tlsEnabled {
 		k.tlsConfig = tlsConf
+
+		// Parse mTLS configuration
+		if conf.Contains(ksfFieldMTLSAuth) {
+			mtlsAuth, err := conf.FieldString(ksfFieldMTLSAuth)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse mtls_auth: %w", err)
+			}
+
+			if mtlsAuth != "" {
+				// Validate and apply client auth type
+				switch mtlsAuth {
+				case "none":
+					k.tlsConfig.ClientAuth = tls.NoClientCert
+				case "request":
+					k.tlsConfig.ClientAuth = tls.RequestClientCert
+				case "require":
+					k.tlsConfig.ClientAuth = tls.RequireAnyClientCert
+				case "verify_if_given":
+					k.tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+				case "require_and_verify":
+					k.tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+				default:
+					return nil, fmt.Errorf("invalid mtls_auth %q (valid options: none, request, require, verify_if_given, require_and_verify)", mtlsAuth)
+				}
+
+				// Parse client CAs
+				var clientCAs string
+				var clientCAsFile string
+
+				if conf.Contains(ksfFieldMTLSCAs) {
+					if clientCAs, err = conf.FieldString(ksfFieldMTLSCAs); err != nil {
+						return nil, fmt.Errorf("failed to parse mtls_cas: %w", err)
+					}
+				}
+
+				if conf.Contains(ksfFieldMTLSCAsFile) {
+					if clientCAsFile, err = conf.FieldString(ksfFieldMTLSCAsFile); err != nil {
+						return nil, fmt.Errorf("failed to parse mtls_cas_file: %w", err)
+					}
+				}
+
+				if clientCAs != "" && clientCAsFile != "" {
+					return nil, fmt.Errorf("only one of mtls_cas or mtls_cas_file can be specified")
+				}
+
+				// Load client CAs if provided
+				if clientCAsFile != "" {
+					caCert, err := ifs.ReadFile(mgr.FS(), clientCAsFile)
+					if err != nil {
+						return nil, fmt.Errorf("failed to read client CA file: %w", err)
+					}
+					k.tlsConfig.ClientCAs = x509.NewCertPool()
+					if !k.tlsConfig.ClientCAs.AppendCertsFromPEM(caCert) {
+						return nil, fmt.Errorf("failed to parse client CA certificates from file")
+					}
+					k.logger.Debugf("Loaded client CAs from file: %s", clientCAsFile)
+				} else if clientCAs != "" {
+					k.tlsConfig.ClientCAs = x509.NewCertPool()
+					if !k.tlsConfig.ClientCAs.AppendCertsFromPEM([]byte(clientCAs)) {
+						return nil, fmt.Errorf("failed to parse client CA certificates")
+					}
+					k.logger.Debugf("Loaded client CAs from inline configuration")
+				}
+
+				k.logger.Infof("mTLS authentication enabled with mode: %s", mtlsAuth)
+			}
+		}
 	}
 
 	// Parse SASL configuration
