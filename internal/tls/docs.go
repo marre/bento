@@ -51,13 +51,13 @@ func FieldSpec() docs.FieldSpec {
 
 		docs.FieldString(
 			"client_auth_type", "Sets the policy the server will follow for TLS client authentication. Only used by server-side components.",
-		).HasAnnotatedOptions(map[string]string{
-			"none":                "Server will not request a client certificate",
-			"request":             "Server will request a client certificate but doesn't require the client to send one",
-			"require":             "Server will require any client certificate (doesn't verify it)",
-			"verify_if_given":     "Server will request a client certificate and verify it if provided",
-			"require_and_verify":  "Server requires a client certificate and will verify it against the client_cas",
-		}).Advanced().HasDefault(""),
+		).HasAnnotatedOptions(
+			"none", "Server will not request a client certificate",
+			"request", "Server will request a client certificate but doesn't require the client to send one",
+			"require", "Server will require any client certificate (doesn't verify it)",
+			"verify_if_given", "Server will request a client certificate and verify it if provided",
+			"require_and_verify", "Server requires a client certificate and will verify it against the client_cas",
+		).Advanced().HasDefault(""),
 
 		docs.FieldString(
 			"client_cas", "An optional PEM encoded string of client certificate authorities to use for verifying client certificates. Only used when client_auth_type is set to verify_if_given or require_and_verify.",

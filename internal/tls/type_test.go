@@ -260,3 +260,154 @@ func TestCertificateWithNoEncryption(t *testing.T) {
 		t.Errorf("Failed to load certificate %s", err)
 	}
 }
+
+func TestMTLSClientAuth(t *testing.T) {
+	tests := []struct {
+		name            string
+		clientAuth      string
+		expectedAuth    uint8
+		expectError     bool
+		errorContains   string
+	}{
+		{
+			name:         "none",
+			clientAuth:   "none",
+			expectedAuth: 0, // tls.NoClientCert
+		},
+		{
+			name:         "request",
+			clientAuth:   "request",
+			expectedAuth: 1, // tls.RequestClientCert
+		},
+		{
+			name:         "require",
+			clientAuth:   "require",
+			expectedAuth: 2, // tls.RequireAnyClientCert
+		},
+		{
+			name:         "verify_if_given",
+			clientAuth:   "verify_if_given",
+			expectedAuth: 3, // tls.VerifyClientCertIfGiven
+		},
+		{
+			name:         "require_and_verify",
+			clientAuth:   "require_and_verify",
+			expectedAuth: 4, // tls.RequireAndVerifyClientCert
+		},
+		{
+			name:          "invalid",
+			clientAuth:    "invalid_option",
+			expectError:   true,
+			errorContains: "invalid client_auth_type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Config{
+				ClientAuth: tt.clientAuth,
+			}
+
+			tlsConf, err := c.GetNonToggled(ifs.OS())
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorContains != "" {
+					require.ErrorContains(t, err, tt.errorContains)
+				}
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, tlsConf)
+			require.Equal(t, tt.expectedAuth, uint8(tlsConf.ClientAuth))
+		})
+	}
+}
+
+func TestMTLSClientCAs(t *testing.T) {
+	// Create a CA certificate
+	caCert, _ := createCertificates()
+
+	t.Run("client_cas inline", func(t *testing.T) {
+		c := Config{
+			ClientCAs: string(caCert),
+		}
+
+		tlsConf, err := c.GetNonToggled(ifs.OS())
+		require.NoError(t, err)
+		require.NotNil(t, tlsConf)
+		require.NotNil(t, tlsConf.ClientCAs)
+	})
+
+	t.Run("client_cas_file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		fCA, err := os.CreateTemp(tmpDir, "ca.pem")
+		require.NoError(t, err)
+		_, err = fCA.Write(caCert)
+		require.NoError(t, err)
+		fCA.Close()
+
+		c := Config{
+			ClientCAsFile: fCA.Name(),
+		}
+
+		tlsConf, err := c.GetNonToggled(ifs.OS())
+		require.NoError(t, err)
+		require.NotNil(t, tlsConf)
+		require.NotNil(t, tlsConf.ClientCAs)
+	})
+
+	t.Run("both client_cas and client_cas_file", func(t *testing.T) {
+		c := Config{
+			ClientCAs:     string(caCert),
+			ClientCAsFile: "/some/path",
+		}
+
+		_, err := c.GetNonToggled(ifs.OS())
+		require.Error(t, err)
+		require.ErrorContains(t, err, "only one field between client_cas and client_cas_file can be specified")
+	})
+}
+
+func TestMTLSFullConfiguration(t *testing.T) {
+	// Create server cert and key
+	serverCert, serverKey := createCertificates()
+	// Create client CA
+	clientCACert, _ := createCertificates()
+
+	tmpDir := t.TempDir()
+
+	// Write server cert/key files
+	fServerCert, _ := os.CreateTemp(tmpDir, "server-cert.pem")
+	_, _ = fServerCert.Write(serverCert)
+	fServerCert.Close()
+
+	fServerKey, _ := os.CreateTemp(tmpDir, "server-key.pem")
+	_, _ = fServerKey.Write(serverKey)
+	fServerKey.Close()
+
+	// Write client CA file
+	fClientCA, _ := os.CreateTemp(tmpDir, "client-ca.pem")
+	_, _ = fClientCA.Write(clientCACert)
+	fClientCA.Close()
+
+	c := Config{
+		ClientCertificates: []ClientCertConfig{
+			{
+				CertFile: fServerCert.Name(),
+				KeyFile:  fServerKey.Name(),
+			},
+		},
+		ClientAuth:    "require_and_verify",
+		ClientCAsFile: fClientCA.Name(),
+	}
+
+	tlsConf, err := c.GetNonToggled(ifs.OS())
+	require.NoError(t, err)
+	require.NotNil(t, tlsConf)
+	require.Len(t, tlsConf.Certificates, 1)
+	require.NotNil(t, tlsConf.ClientCAs)
+	require.Equal(t, uint8(4), uint8(tlsConf.ClientAuth)) // tls.RequireAndVerifyClientCert
+}
+
