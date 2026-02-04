@@ -48,5 +48,25 @@ func FieldSpec() docs.FieldSpec {
 			docs.FieldString("key_file", "The path of a certificate key to use.").HasDefault(""),
 			docs.FieldString("password", "A plain text password for when the private key is password encrypted in PKCS#1 or PKCS#8 format. The obsolete `pbeWithMD5AndDES-CBC` algorithm is not supported for the PKCS#8 format. Warning: Since it does not authenticate the ciphertext, it is vulnerable to padding oracle attacks that can let an attacker recover the plaintext.", "foo", "${KEY_PASSWORD}").HasDefault("").Secret(),
 		).HasDefault([]any{}),
+
+		docs.FieldString(
+			"client_auth_type", "Sets the policy the server will follow for TLS client authentication. Only used by server-side components.",
+		).HasAnnotatedOptions(map[string]string{
+			"none":                "Server will not request a client certificate",
+			"request":             "Server will request a client certificate but doesn't require the client to send one",
+			"require":             "Server will require any client certificate (doesn't verify it)",
+			"verify_if_given":     "Server will request a client certificate and verify it if provided",
+			"require_and_verify":  "Server requires a client certificate and will verify it against the client_cas",
+		}).Advanced().HasDefault(""),
+
+		docs.FieldString(
+			"client_cas", "An optional PEM encoded string of client certificate authorities to use for verifying client certificates. Only used when client_auth_type is set to verify_if_given or require_and_verify.",
+			"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+		).Advanced().HasDefault("").Secret(),
+
+		docs.FieldString(
+			"client_cas_file", "An optional path to a file containing client certificate authorities to use for verifying client certificates. Only used when client_auth_type is set to verify_if_given or require_and_verify.",
+			"./client_cas.pem",
+		).Advanced().HasDefault(""),
 	).Advanced()
 }

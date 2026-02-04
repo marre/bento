@@ -163,6 +163,30 @@ input:
         - cert_file: /path/to/cert.pem
           key_file: /path/to/key.pem
 `).
+		Example("With mTLS", "Accept Kafka produce requests with mutual TLS authentication", `
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    tls:
+      enabled: true
+      client_certs:
+        - cert_file: /path/to/server-cert.pem
+          key_file: /path/to/server-key.pem
+      client_auth_type: require_and_verify
+      client_cas_file: /path/to/client-ca.pem
+`).
+		Example("With mTLS (optional verification)", "Accept Kafka produce requests with optional client certificate verification", `
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    tls:
+      enabled: true
+      client_certs:
+        - cert_file: /path/to/server-cert.pem
+          key_file: /path/to/server-key.pem
+      client_auth_type: verify_if_given
+      client_cas_file: /path/to/client-ca.pem
+`).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
   kafka_server:
