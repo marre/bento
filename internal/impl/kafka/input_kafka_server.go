@@ -31,7 +31,7 @@ const (
 	ksfFieldKeyFile           = "key_file"
 	ksfFieldMTLSAuth          = "mtls_auth"
 	ksfFieldMTLSCAs           = "mtls_cas"
-	ksfFieldMTLSCAsFile       = "mtls_cas_file"
+	ksfFieldMTLSCAsFiles      = "mtls_cas_files"
 	ksfFieldSASL              = "sasl"
 	ksfFieldTimeout           = "timeout"
 	ksfFieldIdleTimeout       = "idle_timeout"
@@ -154,7 +154,7 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Default([]string{}).
 			Advanced().
 			Optional()).
-		Field(service.NewStringListField(ksfFieldMTLSCAsFile).
+		Field(service.NewStringListField(ksfFieldMTLSCAsFiles).
 			Description("An optional list of paths to files containing client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
 			Default([]string{}).
 			Advanced().
@@ -201,7 +201,7 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: require_and_verify
-    mtls_cas_file:
+    mtls_cas_files:
       - /path/to/client-ca.pem
 `).
 		Example("With mTLS (multiple CAs)", "Accept Kafka produce requests with multiple client certificate authorities", `
@@ -211,7 +211,7 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: require_and_verify
-    mtls_cas_file:
+    mtls_cas_files:
       - /path/to/client-ca-1.pem
       - /path/to/client-ca-2.pem
 `).
@@ -222,7 +222,7 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: verify_if_given
-    mtls_cas_file:
+    mtls_cas_files:
       - /path/to/client-ca.pem
 `).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
@@ -411,14 +411,14 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 					}
 				}
 
-				if conf.Contains(ksfFieldMTLSCAsFile) {
-					if clientCAsFiles, err = conf.FieldStringList(ksfFieldMTLSCAsFile); err != nil {
-						return nil, fmt.Errorf("failed to parse mtls_cas_file: %w", err)
+				if conf.Contains(ksfFieldMTLSCAsFiles) {
+					if clientCAsFiles, err = conf.FieldStringList(ksfFieldMTLSCAsFiles); err != nil {
+						return nil, fmt.Errorf("failed to parse mtls_cas_files: %w", err)
 					}
 				}
 
 				if len(clientCAs) > 0 && len(clientCAsFiles) > 0 {
-					return nil, fmt.Errorf("only one of mtls_cas or mtls_cas_file can be specified")
+					return nil, fmt.Errorf("only one of mtls_cas or mtls_cas_files can be specified")
 				}
 
 				// Load client CAs if provided

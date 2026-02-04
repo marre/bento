@@ -1612,7 +1612,7 @@ address: "127.0.0.1:19092"
 cert_file: %s
 key_file: %s
 mtls_auth: require_and_verify
-mtls_cas_file:
+mtls_cas_files:
   - %s
 `, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
@@ -1624,7 +1624,7 @@ address: "127.0.0.1:19092"
 cert_file: %s
 key_file: %s
 mtls_auth: verify_if_given
-mtls_cas_file:
+mtls_cas_files:
   - %s
 `, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
@@ -1786,7 +1786,7 @@ address: "127.0.0.1:19110"
 cert_file: %s
 key_file: %s
 mtls_auth: require_and_verify
-mtls_cas_file:
+mtls_cas_files:
   - %s
 `, serverCertFile, serverKeyFile, clientCAFile)
 
