@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/warpstreamlabs/bento/internal/filepath/ifs"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
@@ -25,7 +27,11 @@ const (
 	ksfFieldAddress           = "address"
 	ksfFieldAdvertisedAddress = "advertised_address"
 	ksfFieldTopics            = "topics"
-	ksfFieldTLS               = "tls"
+	ksfFieldCertFile          = "cert_file"
+	ksfFieldKeyFile           = "key_file"
+	ksfFieldMTLSAuth          = "mtls_auth"
+	ksfFieldMTLSCAs           = "mtls_cas"
+	ksfFieldMTLSCAsFile       = "mtls_cas_file"
 	ksfFieldSASL              = "sasl"
 	ksfFieldTimeout           = "timeout"
 	ksfFieldIdleTimeout       = "idle_timeout"
@@ -124,7 +130,35 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Description("Optional list of topic names to accept. If empty, all topics are accepted.").
 			Default([]string{}).
 			Advanced()).
-		Field(service.NewTLSToggledField(ksfFieldTLS)).
+		Field(service.NewStringField(ksfFieldCertFile).
+			Description("An optional certificate file for enabling TLS.").
+			Advanced().
+			Default("")).
+		Field(service.NewStringField(ksfFieldKeyFile).
+			Description("An optional key file for enabling TLS.").
+			Advanced().
+			Default("")).
+		Field(service.NewStringAnnotatedEnumField(ksfFieldMTLSAuth, map[string]string{
+			"none":                "Server will not request a client certificate",
+			"request":             "Server will request a client certificate but doesn't require the client to send one",
+			"require":             "Server will require any client certificate (doesn't verify it)",
+			"verify_if_given":     "Server will request a client certificate and verify it if provided",
+			"require_and_verify":  "Server requires a client certificate and will verify it against the mtls_cas",
+		}).
+			Description("Sets the policy the server will follow for mTLS client authentication. Only used when TLS is enabled.").
+			Default("").
+			Advanced().
+			Optional()).
+		Field(service.NewStringListField(ksfFieldMTLSCAs).
+			Description("An optional list of PEM encoded strings of client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
+			Default([]string{}).
+			Advanced().
+			Optional()).
+		Field(service.NewStringListField(ksfFieldMTLSCAsFile).
+			Description("An optional list of paths to files containing client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
+			Default([]string{}).
+			Advanced().
+			Optional()).
 		Field(saslServerField()).
 		Field(service.NewDurationField(ksfFieldTimeout).
 			Description("The maximum time to wait for a produce request to be processed by the pipeline and acknowledged. This timeout also applies to write operations when sending responses back to clients. If processing takes longer than this duration, the producer receives a timeout error, but the message may still be delivered to the pipeline.").
@@ -157,45 +191,46 @@ output:
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
 `).
 		Example("With mTLS", "Accept Kafka produce requests with mutual TLS authentication", `
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
-      client_auth_type: require_and_verify
-      client_cas_file: /path/to/client-ca.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: require_and_verify
+    mtls_cas_file:
+      - /path/to/client-ca.pem
+`).
+		Example("With mTLS (multiple CAs)", "Accept Kafka produce requests with multiple client certificate authorities", `
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: require_and_verify
+    mtls_cas_file:
+      - /path/to/client-ca-1.pem
+      - /path/to/client-ca-2.pem
 `).
 		Example("With mTLS (optional verification)", "Accept Kafka produce requests with optional client certificate verification", `
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
-      client_auth_type: verify_if_given
-      client_cas_file: /path/to/client-ca.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: verify_if_given
+    mtls_cas_file:
+      - /path/to/client-ca.pem
 `).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: PLAIN
         username: producer1
@@ -208,11 +243,8 @@ input:
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: SCRAM-SHA-256
         username: producer1
@@ -322,13 +354,101 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 		}
 	}
 
-	// Parse TLS configuration
-	tlsConf, tlsEnabled, err := conf.FieldTLSToggled(ksfFieldTLS)
-	if err != nil {
+	// Parse TLS configuration (cert_file and key_file)
+	var certFile, keyFile string
+	if certFile, err = conf.FieldString(ksfFieldCertFile); err != nil {
 		return nil, err
 	}
-	if tlsEnabled {
-		k.tlsConfig = tlsConf
+	if keyFile, err = conf.FieldString(ksfFieldKeyFile); err != nil {
+		return nil, err
+	}
+
+	// If both cert and key are provided, set up TLS
+	if certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+
+		k.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+
+		k.logger.Infof("TLS enabled with certificate: %s", certFile)
+
+		// Parse mTLS configuration
+		if conf.Contains(ksfFieldMTLSAuth) {
+			mtlsAuth, err := conf.FieldString(ksfFieldMTLSAuth)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse mtls_auth: %w", err)
+			}
+
+			if mtlsAuth != "" {
+				// Validate and apply client auth type
+				switch mtlsAuth {
+				case "none":
+					k.tlsConfig.ClientAuth = tls.NoClientCert
+				case "request":
+					k.tlsConfig.ClientAuth = tls.RequestClientCert
+				case "require":
+					k.tlsConfig.ClientAuth = tls.RequireAnyClientCert
+				case "verify_if_given":
+					k.tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+				case "require_and_verify":
+					k.tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+				default:
+					return nil, fmt.Errorf("invalid mtls_auth %q (valid options: none, request, require, verify_if_given, require_and_verify)", mtlsAuth)
+				}
+
+				// Parse client CAs
+				var clientCAs []string
+				var clientCAsFiles []string
+
+				if conf.Contains(ksfFieldMTLSCAs) {
+					if clientCAs, err = conf.FieldStringList(ksfFieldMTLSCAs); err != nil {
+						return nil, fmt.Errorf("failed to parse mtls_cas: %w", err)
+					}
+				}
+
+				if conf.Contains(ksfFieldMTLSCAsFile) {
+					if clientCAsFiles, err = conf.FieldStringList(ksfFieldMTLSCAsFile); err != nil {
+						return nil, fmt.Errorf("failed to parse mtls_cas_file: %w", err)
+					}
+				}
+
+				if len(clientCAs) > 0 && len(clientCAsFiles) > 0 {
+					return nil, fmt.Errorf("only one of mtls_cas or mtls_cas_file can be specified")
+				}
+
+				// Load client CAs if provided
+				if len(clientCAsFiles) > 0 {
+					k.tlsConfig.ClientCAs = x509.NewCertPool()
+					for _, clientCAsFile := range clientCAsFiles {
+						caCert, err := ifs.ReadFile(mgr.FS(), clientCAsFile)
+						if err != nil {
+							return nil, fmt.Errorf("failed to read client CA file %s: %w", clientCAsFile, err)
+						}
+						if !k.tlsConfig.ClientCAs.AppendCertsFromPEM(caCert) {
+							return nil, fmt.Errorf("failed to parse client CA certificates from file %s", clientCAsFile)
+						}
+					}
+					k.logger.Debugf("Loaded client CAs from %d file(s)", len(clientCAsFiles))
+				} else if len(clientCAs) > 0 {
+					k.tlsConfig.ClientCAs = x509.NewCertPool()
+					for _, clientCA := range clientCAs {
+						if !k.tlsConfig.ClientCAs.AppendCertsFromPEM([]byte(clientCA)) {
+							return nil, fmt.Errorf("failed to parse client CA certificate")
+						}
+					}
+					k.logger.Debugf("Loaded %d client CA(s) from inline configuration", len(clientCAs))
+				}
+
+				k.logger.Infof("mTLS authentication enabled with mode: %s", mtlsAuth)
+			}
+		}
+	} else if certFile != "" || keyFile != "" {
+		return nil, fmt.Errorf("both cert_file and key_file must be specified to enable TLS")
 	}
 
 	// Parse SASL configuration

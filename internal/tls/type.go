@@ -30,9 +30,6 @@ type Config struct {
 	InsecureSkipVerify  bool               `json:"skip_cert_verify" yaml:"skip_cert_verify"`
 	ClientCertificates  []ClientCertConfig `json:"client_certs" yaml:"client_certs"`
 	EnableRenegotiation bool               `json:"enable_renegotiation" yaml:"enable_renegotiation"`
-	ClientAuth          string             `json:"client_auth_type" yaml:"client_auth_type"`
-	ClientCAs           string             `json:"client_cas" yaml:"client_cas"`
-	ClientCAsFile       string             `json:"client_cas_file" yaml:"client_cas_file"`
 }
 
 // NewConfig creates a new Config with default values.
@@ -44,9 +41,6 @@ func NewConfig() Config {
 		InsecureSkipVerify:  false,
 		ClientCertificates:  []ClientCertConfig{},
 		EnableRenegotiation: false,
-		ClientAuth:          "",
-		ClientCAs:           "",
-		ClientCAsFile:       "",
 	}
 }
 
@@ -107,46 +101,6 @@ func (c *Config) GetNonToggled(f ifs.FS) (*tls.Config, error) {
 	if c.InsecureSkipVerify {
 		initConf()
 		tlsConf.InsecureSkipVerify = true
-	}
-
-	// Handle client CA configuration (for server-side mTLS)
-	if c.ClientCAs != "" && c.ClientCAsFile != "" {
-		return nil, errors.New("only one field between client_cas and client_cas_file can be specified")
-	}
-
-	if c.ClientCAsFile != "" {
-		clientCACert, err := ifs.ReadFile(f, c.ClientCAsFile)
-		if err != nil {
-			return nil, err
-		}
-		initConf()
-		tlsConf.ClientCAs = x509.NewCertPool()
-		tlsConf.ClientCAs.AppendCertsFromPEM(clientCACert)
-	}
-
-	if c.ClientCAs != "" {
-		initConf()
-		tlsConf.ClientCAs = x509.NewCertPool()
-		tlsConf.ClientCAs.AppendCertsFromPEM([]byte(c.ClientCAs))
-	}
-
-	// Handle client authentication type (for server-side mTLS)
-	if c.ClientAuth != "" {
-		initConf()
-		switch c.ClientAuth {
-		case "none", "":
-			tlsConf.ClientAuth = tls.NoClientCert
-		case "request":
-			tlsConf.ClientAuth = tls.RequestClientCert
-		case "require":
-			tlsConf.ClientAuth = tls.RequireAnyClientCert
-		case "verify_if_given":
-			tlsConf.ClientAuth = tls.VerifyClientCertIfGiven
-		case "require_and_verify":
-			tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
-		default:
-			return nil, fmt.Errorf("invalid client_auth_type %q (valid options: none, request, require, verify_if_given, require_and_verify)", c.ClientAuth)
-		}
 	}
 
 	return tlsConf, nil
