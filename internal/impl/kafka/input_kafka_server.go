@@ -19,7 +19,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
-	"github.com/warpstreamlabs/bento/internal/filepath/ifs"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
@@ -31,7 +30,6 @@ const (
 	ksfFieldKeyFile           = "key_file"
 	ksfFieldMTLSAuth          = "mtls_auth"
 	ksfFieldMTLSCAs           = "mtls_cas"
-	ksfFieldMTLSCAsFiles      = "mtls_cas_files"
 	ksfFieldSASL              = "sasl"
 	ksfFieldTimeout           = "timeout"
 	ksfFieldIdleTimeout       = "idle_timeout"
@@ -131,11 +129,11 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Default([]string{}).
 			Advanced()).
 		Field(service.NewStringField(ksfFieldCertFile).
-			Description("An optional certificate file for enabling TLS.").
+			Description("An optional server certificate file for enabling TLS.").
 			Advanced().
 			Default("")).
 		Field(service.NewStringField(ksfFieldKeyFile).
-			Description("An optional key file for enabling TLS.").
+			Description("An optional server key file for enabling TLS.").
 			Advanced().
 			Default("")).
 		Field(service.NewStringAnnotatedEnumField(ksfFieldMTLSAuth, map[string]string{
@@ -151,11 +149,6 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Optional()).
 		Field(service.NewStringListField(ksfFieldMTLSCAs).
 			Description("An optional list of PEM encoded strings of client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
-			Default([]string{}).
-			Advanced().
-			Optional()).
-		Field(service.NewStringListField(ksfFieldMTLSCAsFiles).
-			Description("An optional list of paths to files containing client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.").
 			Default([]string{}).
 			Advanced().
 			Optional()).
@@ -201,8 +194,11 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: require_and_verify
-    mtls_cas_files:
-      - /path/to/client-ca.pem
+    mtls_cas:
+      - |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
 `).
 		Example("With mTLS (multiple CAs)", "Accept Kafka produce requests with multiple client certificate authorities", `
 input:
@@ -211,9 +207,15 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: require_and_verify
-    mtls_cas_files:
-      - /path/to/client-ca-1.pem
-      - /path/to/client-ca-2.pem
+    mtls_cas:
+      - |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
+      - |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
 `).
 		Example("With mTLS (optional verification)", "Accept Kafka produce requests with optional client certificate verification", `
 input:
@@ -222,8 +224,11 @@ input:
     cert_file: /path/to/server-cert.pem
     key_file: /path/to/server-key.pem
     mtls_auth: verify_if_given
-    mtls_cas_files:
-      - /path/to/client-ca.pem
+    mtls_cas:
+      - |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
 `).
 		Example("With SASL PLAIN Authentication", "Accept authenticated Kafka produce requests using PLAIN", `
 input:
@@ -403,7 +408,6 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 
 				// Parse client CAs
 				var clientCAs []string
-				var clientCAsFiles []string
 
 				if conf.Contains(ksfFieldMTLSCAs) {
 					if clientCAs, err = conf.FieldStringList(ksfFieldMTLSCAs); err != nil {
@@ -411,30 +415,8 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 					}
 				}
 
-				if conf.Contains(ksfFieldMTLSCAsFiles) {
-					if clientCAsFiles, err = conf.FieldStringList(ksfFieldMTLSCAsFiles); err != nil {
-						return nil, fmt.Errorf("failed to parse mtls_cas_files: %w", err)
-					}
-				}
-
-				if len(clientCAs) > 0 && len(clientCAsFiles) > 0 {
-					return nil, fmt.Errorf("only one of mtls_cas or mtls_cas_files can be specified")
-				}
-
 				// Load client CAs if provided
-				if len(clientCAsFiles) > 0 {
-					k.tlsConfig.ClientCAs = x509.NewCertPool()
-					for _, clientCAsFile := range clientCAsFiles {
-						caCert, err := ifs.ReadFile(mgr.FS(), clientCAsFile)
-						if err != nil {
-							return nil, fmt.Errorf("failed to read client CA file %s: %w", clientCAsFile, err)
-						}
-						if !k.tlsConfig.ClientCAs.AppendCertsFromPEM(caCert) {
-							return nil, fmt.Errorf("failed to parse client CA certificates from file %s", clientCAsFile)
-						}
-					}
-					k.logger.Debugf("Loaded client CAs from %d file(s)", len(clientCAsFiles))
-				} else if len(clientCAs) > 0 {
+				if len(clientCAs) > 0 {
 					k.tlsConfig.ClientCAs = x509.NewCertPool()
 					for _, clientCA := range clientCAs {
 						if !k.tlsConfig.ClientCAs.AppendCertsFromPEM([]byte(clientCA)) {

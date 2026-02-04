@@ -1590,15 +1590,14 @@ func TestKafkaServerInputMTLSConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	certFile := tmpDir + "/test-cert.pem"
 	keyFile := tmpDir + "/test-key.pem"
-	caFile := tmpDir + "/test-ca.pem"
 	
 	// Write dummy files (they'll fail to load, but that's expected for these config tests)
 	err := os.WriteFile(certFile, []byte("dummy cert"), 0600)
 	require.NoError(t, err)
 	err = os.WriteFile(keyFile, []byte("dummy key"), 0600)
 	require.NoError(t, err)
-	err = os.WriteFile(caFile, []byte("dummy ca"), 0600)
-	require.NoError(t, err)
+
+	dummyCA := "-----BEGIN CERTIFICATE-----\nMIICxjCCAa4CCQDummyCA==\n-----END CERTIFICATE-----"
 
 	tests := []struct {
 		name    string
@@ -1612,9 +1611,9 @@ address: "127.0.0.1:19092"
 cert_file: %s
 key_file: %s
 mtls_auth: require_and_verify
-mtls_cas_files:
-  - %s
-`, certFile, keyFile, caFile),
+mtls_cas:
+  - %q
+`, certFile, keyFile, dummyCA),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
@@ -1624,9 +1623,9 @@ address: "127.0.0.1:19092"
 cert_file: %s
 key_file: %s
 mtls_auth: verify_if_given
-mtls_cas_files:
-  - %s
-`, certFile, keyFile, caFile),
+mtls_cas:
+  - %q
+`, certFile, keyFile, dummyCA),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
@@ -1766,7 +1765,7 @@ func TestKafkaServerInputMTLSIntegration(t *testing.T) {
 	spec := kafkaServerInputConfig()
 	env := service.NewEnvironment()
 
-	// Write certificates to temp files
+	// Write server certificates to temp files
 	tmpDir := t.TempDir()
 	
 	serverCertFile := tmpDir + "/server-cert.pem"
@@ -1776,19 +1775,15 @@ func TestKafkaServerInputMTLSIntegration(t *testing.T) {
 	serverKeyFile := tmpDir + "/server-key.pem"
 	err = os.WriteFile(serverKeyFile, serverKeyPEM, 0600)
 	require.NoError(t, err)
-	
-	clientCAFile := tmpDir + "/client-ca.pem"
-	err = os.WriteFile(clientCAFile, caCertPEM, 0600)
-	require.NoError(t, err)
 
 	config := fmt.Sprintf(`
 address: "127.0.0.1:19110"
 cert_file: %s
 key_file: %s
 mtls_auth: require_and_verify
-mtls_cas_files:
-  - %s
-`, serverCertFile, serverKeyFile, clientCAFile)
+mtls_cas:
+  - %q
+`, serverCertFile, serverKeyFile, string(caCertPEM))
 
 	parsed, err := spec.ParseYAML(config, env)
 	require.NoError(t, err)
