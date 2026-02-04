@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -1587,6 +1586,20 @@ func TestProduceResponsePartitionSerialization(t *testing.T) {
 }
 
 func TestKafkaServerInputMTLSConfig(t *testing.T) {
+	// Create temporary certificate files for testing
+	tmpDir := t.TempDir()
+	certFile := tmpDir + "/test-cert.pem"
+	keyFile := tmpDir + "/test-key.pem"
+	caFile := tmpDir + "/test-ca.pem"
+	
+	// Write dummy files (they'll fail to load, but that's expected for these config tests)
+	err := os.WriteFile(certFile, []byte("dummy cert"), 0600)
+	require.NoError(t, err)
+	err = os.WriteFile(keyFile, []byte("dummy key"), 0600)
+	require.NoError(t, err)
+	err = os.WriteFile(caFile, []byte("dummy ca"), 0600)
+	require.NoError(t, err)
+
 	tests := []struct {
 		name    string
 		config  string
@@ -1594,86 +1607,60 @@ func TestKafkaServerInputMTLSConfig(t *testing.T) {
 	}{
 		{
 			name: "valid mTLS config with require_and_verify",
-			config: `
+			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-tls:
-  enabled: true
-  client_certs:
-    - cert: |
-        -----BEGIN CERTIFICATE-----
-        test
-        -----END CERTIFICATE-----
-      key: |
-        -----BEGIN RSA PRIVATE KEY-----
-        test
-        -----END RSA PRIVATE KEY-----
+cert_file: %s
+key_file: %s
 mtls_auth: require_and_verify
-mtls_cas: |
-  -----BEGIN CERTIFICATE-----
-  test
-  -----END CERTIFICATE-----
-`,
+mtls_cas_file: %s
+`, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
 			name: "valid mTLS config with verify_if_given",
-			config: `
+			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-tls:
-  enabled: true
-  client_certs:
-    - cert: |
-        -----BEGIN CERTIFICATE-----
-        test
-        -----END CERTIFICATE-----
-      key: |
-        -----BEGIN RSA PRIVATE KEY-----
-        test
-        -----END RSA PRIVATE KEY-----
+cert_file: %s
+key_file: %s
 mtls_auth: verify_if_given
-mtls_cas: |
-  -----BEGIN CERTIFICATE-----
-  test
-  -----END CERTIFICATE-----
-`,
+mtls_cas_file: %s
+`, certFile, keyFile, caFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
 			name: "valid mTLS config with request",
-			config: `
+			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-tls:
-  enabled: true
-  client_certs:
-    - cert: |
-        -----BEGIN CERTIFICATE-----
-        test
-        -----END CERTIFICATE-----
-      key: |
-        -----BEGIN RSA PRIVATE KEY-----
-        test
-        -----END RSA PRIVATE KEY-----
+cert_file: %s
+key_file: %s
 mtls_auth: request
-`,
+`, certFile, keyFile),
 			wantErr: true, // Will error on invalid cert, but config parsing should succeed
 		},
 		{
 			name: "invalid mtls_auth",
-			config: `
+			config: fmt.Sprintf(`
 address: "127.0.0.1:19092"
-tls:
-  enabled: true
-  client_certs:
-    - cert: |
-        -----BEGIN CERTIFICATE-----
-        test
-        -----END CERTIFICATE-----
-      key: |
-        -----BEGIN RSA PRIVATE KEY-----
-        test
-        -----END RSA PRIVATE KEY-----
+cert_file: %s
+key_file: %s
 mtls_auth: invalid_option
-`,
+`, certFile, keyFile),
+			wantErr: true,
+		},
+		{
+			name: "cert_file without key_file",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+`, certFile),
+			wantErr: true,
+		},
+		{
+			name: "key_file without cert_file",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+key_file: %s
+`, keyFile),
 			wantErr: true,
 		},
 	}
@@ -1777,19 +1764,28 @@ func TestKafkaServerInputMTLSIntegration(t *testing.T) {
 	spec := kafkaServerInputConfig()
 	env := service.NewEnvironment()
 
+	// Write certificates to temp files
+	tmpDir := t.TempDir()
+	
+	serverCertFile := tmpDir + "/server-cert.pem"
+	err = os.WriteFile(serverCertFile, serverCertPEM, 0600)
+	require.NoError(t, err)
+	
+	serverKeyFile := tmpDir + "/server-key.pem"
+	err = os.WriteFile(serverKeyFile, serverKeyPEM, 0600)
+	require.NoError(t, err)
+	
+	clientCAFile := tmpDir + "/client-ca.pem"
+	err = os.WriteFile(clientCAFile, caCertPEM, 0600)
+	require.NoError(t, err)
+
 	config := fmt.Sprintf(`
 address: "127.0.0.1:19110"
-tls:
-  enabled: true
-  client_certs:
-    - cert: |
-%s
-      key: |
-%s
+cert_file: %s
+key_file: %s
 mtls_auth: require_and_verify
-mtls_cas: |
-%s
-`, indentPEM(string(serverCertPEM), 8), indentPEM(string(serverKeyPEM), 8), indentPEM(string(caCertPEM), 2))
+mtls_cas_file: %s
+`, serverCertFile, serverKeyFile, clientCAFile)
 
 	parsed, err := spec.ParseYAML(config, env)
 	require.NoError(t, err)
@@ -1900,17 +1896,3 @@ mtls_cas: |
 	})
 }
 
-// indentPEM adds indentation to each line of PEM content
-func indentPEM(pem string, spaces int) string {
-	indent := ""
-	for i := 0; i < spaces; i++ {
-		indent += " "
-	}
-	lines := []string{}
-	for _, line := range strings.Split(pem, "\n") {
-		if line != "" {
-			lines = append(lines, indent+line)
-		}
-	}
-	return strings.Join(lines, "\n")
-}

@@ -27,7 +27,8 @@ const (
 	ksfFieldAddress           = "address"
 	ksfFieldAdvertisedAddress = "advertised_address"
 	ksfFieldTopics            = "topics"
-	ksfFieldTLS               = "tls"
+	ksfFieldCertFile          = "cert_file"
+	ksfFieldKeyFile           = "key_file"
 	ksfFieldMTLSAuth          = "mtls_auth"
 	ksfFieldMTLSCAs           = "mtls_cas"
 	ksfFieldMTLSCAsFile       = "mtls_cas_file"
@@ -129,7 +130,14 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Description("Optional list of topic names to accept. If empty, all topics are accepted.").
 			Default([]string{}).
 			Advanced()).
-		Field(service.NewTLSToggledField(ksfFieldTLS)).
+		Field(service.NewStringField(ksfFieldCertFile).
+			Description("An optional certificate file for enabling TLS.").
+			Advanced().
+			Default("")).
+		Field(service.NewStringField(ksfFieldKeyFile).
+			Description("An optional key file for enabling TLS.").
+			Advanced().
+			Default("")).
 		Field(service.NewStringAnnotatedEnumField(ksfFieldMTLSAuth, map[string]string{
 			"none":                "Server will not request a client certificate",
 			"request":             "Server will request a client certificate but doesn't require the client to send one",
@@ -184,23 +192,15 @@ output:
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
 `).
 		Example("With mTLS", "Accept Kafka produce requests with mutual TLS authentication", `
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      # Server's certificate and key (note: the TLS field is named client_certs for historical reasons)
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
-    # Require and verify client certificates
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     mtls_auth: require_and_verify
     mtls_cas_file: /path/to/client-ca.pem
 `).
@@ -208,13 +208,8 @@ input:
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      # Server's certificate and key
-      client_certs:
-        - cert_file: /path/to/server-cert.pem
-          key_file: /path/to/server-key.pem
-    # Verify client certificates if provided (optional)
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     mtls_auth: verify_if_given
     mtls_cas_file: /path/to/client-ca.pem
 `).
@@ -222,11 +217,8 @@ input:
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: PLAIN
         username: producer1
@@ -239,11 +231,8 @@ input:
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: SCRAM-SHA-256
         username: producer1
@@ -353,12 +342,28 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 		}
 	}
 
-	tlsConf, tlsEnabled, err := conf.FieldTLSToggled(ksfFieldTLS)
-	if err != nil {
+	// Parse TLS configuration (cert_file and key_file)
+	var certFile, keyFile string
+	if certFile, err = conf.FieldString(ksfFieldCertFile); err != nil {
 		return nil, err
 	}
-	if tlsEnabled {
-		k.tlsConfig = tlsConf
+	if keyFile, err = conf.FieldString(ksfFieldKeyFile); err != nil {
+		return nil, err
+	}
+
+	// If both cert and key are provided, set up TLS
+	if certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+
+		k.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+
+		k.logger.Infof("TLS enabled with certificate: %s", certFile)
 
 		// Parse mTLS configuration
 		if conf.Contains(ksfFieldMTLSAuth) {
@@ -426,6 +431,8 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 				k.logger.Infof("mTLS authentication enabled with mode: %s", mtlsAuth)
 			}
 		}
+	} else if certFile != "" || keyFile != "" {
+		return nil, fmt.Errorf("both cert_file and key_file must be specified to enable TLS")
 	}
 
 	// Parse SASL configuration
