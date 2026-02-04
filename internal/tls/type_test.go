@@ -263,11 +263,11 @@ func TestCertificateWithNoEncryption(t *testing.T) {
 
 func TestMTLSClientAuth(t *testing.T) {
 	tests := []struct {
-		name            string
-		clientAuth      string
-		expectedAuth    uint8
-		expectError     bool
-		errorContains   string
+		name          string
+		clientAuth    string
+		expectedAuth  uint8
+		expectError   bool
+		errorContains string
 	}{
 		{
 			name:         "none",
@@ -379,18 +379,27 @@ func TestMTLSFullConfiguration(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Write server cert/key files
-	fServerCert, _ := os.CreateTemp(tmpDir, "server-cert.pem")
-	_, _ = fServerCert.Write(serverCert)
-	fServerCert.Close()
+	fServerCert, err := os.CreateTemp(tmpDir, "server-cert.pem")
+	require.NoError(t, err)
+	_, err = fServerCert.Write(serverCert)
+	require.NoError(t, err)
+	err = fServerCert.Close()
+	require.NoError(t, err)
 
-	fServerKey, _ := os.CreateTemp(tmpDir, "server-key.pem")
-	_, _ = fServerKey.Write(serverKey)
-	fServerKey.Close()
+	fServerKey, err := os.CreateTemp(tmpDir, "server-key.pem")
+	require.NoError(t, err)
+	_, err = fServerKey.Write(serverKey)
+	require.NoError(t, err)
+	err = fServerKey.Close()
+	require.NoError(t, err)
 
 	// Write client CA file
-	fClientCA, _ := os.CreateTemp(tmpDir, "client-ca.pem")
-	_, _ = fClientCA.Write(clientCACert)
-	fClientCA.Close()
+	fClientCA, err := os.CreateTemp(tmpDir, "client-ca.pem")
+	require.NoError(t, err)
+	_, err = fClientCA.Write(clientCACert)
+	require.NoError(t, err)
+	err = fClientCA.Close()
+	require.NoError(t, err)
 
 	c := Config{
 		ClientCertificates: []ClientCertConfig{
@@ -410,4 +419,3 @@ func TestMTLSFullConfiguration(t *testing.T) {
 	require.NotNil(t, tlsConf.ClientCAs)
 	require.Equal(t, uint8(4), uint8(tlsConf.ClientAuth)) // tls.RequireAndVerifyClientCert
 }
-

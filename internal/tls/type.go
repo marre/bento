@@ -134,7 +134,7 @@ func (c *Config) GetNonToggled(f ifs.FS) (*tls.Config, error) {
 	if c.ClientAuth != "" {
 		initConf()
 		switch c.ClientAuth {
-		case "none", "":
+		case "none":
 			tlsConf.ClientAuth = tls.NoClientCert
 		case "request":
 			tlsConf.ClientAuth = tls.RequestClientCert
