@@ -1592,12 +1592,57 @@ func TestKafkaServerInputMTLSConfig(t *testing.T) {
 	keyFile := tmpDir + "/test-key.pem"
 	caFile := tmpDir + "/test-ca.pem"
 	
-	// Write dummy files (they'll fail to load, but that's expected for these config tests)
-	err := os.WriteFile(certFile, []byte("dummy cert"), 0600)
+	// Generate real certificates for validation tests
+	// Create CA key and certificate
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	err = os.WriteFile(keyFile, []byte("dummy key"), 0600)
+
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test CA"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
 	require.NoError(t, err)
-	err = os.WriteFile(caFile, []byte("dummy ca"), 0600)
+
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	err = os.WriteFile(caFile, caCertPEM, 0600)
+	require.NoError(t, err)
+
+	// Create server key and certificate signed by CA
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	serverTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			Organization: []string{"Test Server"},
+		},
+		NotBefore:   time.Now().Add(-time.Hour),
+		NotAfter:    time.Now().Add(time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
+	err = os.WriteFile(certFile, serverCertPEM, 0600)
+	require.NoError(t, err)
+
+	serverKeyDER := x509.MarshalPKCS1PrivateKey(serverKey)
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: serverKeyDER})
+	err = os.WriteFile(keyFile, serverKeyPEM, 0600)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -1615,7 +1660,7 @@ mtls_auth: require_and_verify
 mtls_cas_files:
   - %s
 `, certFile, keyFile, caFile),
-			wantErr: true, // Will error on invalid cert, but config parsing should succeed
+			wantErr: false, // Valid config
 		},
 		{
 			name: "valid mTLS config with verify_if_given",
@@ -1627,7 +1672,7 @@ mtls_auth: verify_if_given
 mtls_cas_files:
   - %s
 `, certFile, keyFile, caFile),
-			wantErr: true, // Will error on invalid cert, but config parsing should succeed
+			wantErr: false, // Valid config
 		},
 		{
 			name: "valid mTLS config with request",
@@ -1637,7 +1682,7 @@ cert_file: %s
 key_file: %s
 mtls_auth: request
 `, certFile, keyFile),
-			wantErr: true, // Will error on invalid cert, but config parsing should succeed
+			wantErr: false, // Valid config
 		},
 		{
 			name: "invalid mtls_auth",
@@ -1665,6 +1710,26 @@ key_file: %s
 `, keyFile),
 			wantErr: true,
 		},
+		{
+			name: "require_and_verify without mtls_cas_files",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: require_and_verify
+`, certFile, keyFile),
+			wantErr: true,
+		},
+		{
+			name: "verify_if_given without mtls_cas_files",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: verify_if_given
+`, certFile, keyFile),
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1677,11 +1742,10 @@ key_file: %s
 
 			_, err = newKafkaServerInputFromConfig(parsed, service.MockResources())
 			if tt.wantErr {
-				// We expect an error (either from invalid config or invalid certs)
-				// The important thing is that the mTLS fields are parsed correctly
+				require.Error(t, err, "Expected an error but got none")
 				t.Logf("Got expected error: %v", err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err, "Expected no error but got: %v", err)
 			}
 		})
 	}

@@ -404,6 +404,11 @@ func newKafkaServerInputFromConfig(conf *service.ParsedConfig, mgr *service.Reso
 					}
 				}
 
+				// Validate that CAs are provided for verification modes
+				if (mtlsAuth == "verify_if_given" || mtlsAuth == "require_and_verify") && len(clientCAsFiles) == 0 {
+					return nil, fmt.Errorf("mtls_cas_files must be specified when mtls_auth is set to %q", mtlsAuth)
+				}
+
 				// Load client CAs if provided
 				if len(clientCAsFiles) > 0 {
 					k.tlsConfig.ClientCAs = x509.NewCertPool()
