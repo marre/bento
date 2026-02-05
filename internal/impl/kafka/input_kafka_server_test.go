@@ -2,8 +2,15 @@ package kafka
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"testing"
 	"time"
@@ -1577,3 +1584,382 @@ func TestProduceResponsePartitionSerialization(t *testing.T) {
 		assert.Equal(t, int16(0), parsedResp.Topics[0].Partitions[0].ErrorCode)
 	})
 }
+
+func TestKafkaServerInputMTLSConfig(t *testing.T) {
+	// Create temporary certificate files for testing
+	tmpDir := t.TempDir()
+	certFile := tmpDir + "/test-cert.pem"
+	keyFile := tmpDir + "/test-key.pem"
+	caFile := tmpDir + "/test-ca.pem"
+	
+	// Generate real certificates for validation tests
+	// Create CA key and certificate
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test CA"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	err = os.WriteFile(caFile, caCertPEM, 0600)
+	require.NoError(t, err)
+
+	// Create server key and certificate signed by CA
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	serverTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			Organization: []string{"Test Server"},
+		},
+		NotBefore:   time.Now().Add(-time.Hour),
+		NotAfter:    time.Now().Add(time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
+	err = os.WriteFile(certFile, serverCertPEM, 0600)
+	require.NoError(t, err)
+
+	serverKeyDER := x509.MarshalPKCS1PrivateKey(serverKey)
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: serverKeyDER})
+	err = os.WriteFile(keyFile, serverKeyPEM, 0600)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		config  string
+		wantErr bool
+	}{
+		{
+			name: "valid mTLS config with require_and_verify",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: require_and_verify
+mtls_cas_files:
+  - %s
+`, certFile, keyFile, caFile),
+			wantErr: false, // Valid config
+		},
+		{
+			name: "valid mTLS config with verify_if_given",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: verify_if_given
+mtls_cas_files:
+  - %s
+`, certFile, keyFile, caFile),
+			wantErr: false, // Valid config
+		},
+		{
+			name: "valid mTLS config with request",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: request
+`, certFile, keyFile),
+			wantErr: false, // Valid config
+		},
+		{
+			name: "invalid mtls_auth",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: invalid_option
+`, certFile, keyFile),
+			wantErr: true,
+		},
+		{
+			name: "cert_file without key_file",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+`, certFile),
+			wantErr: true,
+		},
+		{
+			name: "key_file without cert_file",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+key_file: %s
+`, keyFile),
+			wantErr: true,
+		},
+		{
+			name: "require_and_verify without mtls_cas_files",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: require_and_verify
+`, certFile, keyFile),
+			wantErr: true,
+		},
+		{
+			name: "verify_if_given without mtls_cas_files",
+			config: fmt.Sprintf(`
+address: "127.0.0.1:19092"
+cert_file: %s
+key_file: %s
+mtls_auth: verify_if_given
+`, certFile, keyFile),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := kafkaServerInputConfig()
+			env := service.NewEnvironment()
+
+			parsed, err := spec.ParseYAML(tt.config, env)
+			require.NoError(t, err, "Config should parse successfully")
+
+			_, err = newKafkaServerInputFromConfig(parsed, service.MockResources())
+			if tt.wantErr {
+				require.Error(t, err, "Expected an error but got none")
+				t.Logf("Got expected error: %v", err)
+			} else {
+				require.NoError(t, err, "Expected no error but got: %v", err)
+			}
+		})
+	}
+}
+
+func TestKafkaServerInputMTLSIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create CA key and certificate
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test CA"},
+			CommonName:   "Test CA",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+
+	// Create server key and certificate
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	serverTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			Organization: []string{"Test Server"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
+
+	// Create client key and certificate
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	clientTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject: pkix.Name{
+			Organization: []string{"Test Client"},
+			CommonName:   "test-client",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+
+	clientCertDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientKey.PublicKey, caKey)
+	require.NoError(t, err)
+
+	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER})
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
+
+	// Create kafka_server input with mTLS
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	// Write certificates to temp files
+	tmpDir := t.TempDir()
+	
+	serverCertFile := tmpDir + "/server-cert.pem"
+	err = os.WriteFile(serverCertFile, serverCertPEM, 0600)
+	require.NoError(t, err)
+	
+	serverKeyFile := tmpDir + "/server-key.pem"
+	err = os.WriteFile(serverKeyFile, serverKeyPEM, 0600)
+	require.NoError(t, err)
+	
+	clientCAFile := tmpDir + "/client-ca.pem"
+	err = os.WriteFile(clientCAFile, caCertPEM, 0600)
+	require.NoError(t, err)
+
+	config := fmt.Sprintf(`
+address: "127.0.0.1:19110"
+cert_file: %s
+key_file: %s
+mtls_auth: require_and_verify
+mtls_cas_files:
+  - %s
+`, serverCertFile, serverKeyFile, clientCAFile)
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Test 1: Client with valid certificate should connect
+	t.Run("valid_client_cert", func(t *testing.T) {
+		clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+		require.NoError(t, err)
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCertPEM)
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{clientCert},
+			RootCAs:      caCertPool,
+		}
+
+		client, err := kgo.NewClient(
+			kgo.SeedBrokers("127.0.0.1:19110"),
+			kgo.DialTLSConfig(tlsConfig),
+			kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+				return "[CLIENT-VALID] "
+			})),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		testTopic := "test-topic-mtls"
+		testValue := "test-value-mtls"
+
+		record := &kgo.Record{
+			Topic: testTopic,
+			Value: []byte(testValue),
+		}
+
+		// Use channel for synchronization
+		produceChan := make(chan error, 1)
+		go func() {
+			results := client.ProduceSync(ctx, record)
+			if len(results) > 0 {
+				produceChan <- results[0].Err
+			}
+		}()
+
+		// Read message from input
+		batch, ackFn, err := input.ReadBatch(ctx)
+		require.NoError(t, err)
+		require.Len(t, batch, 1)
+
+		msgBytes, err := batch[0].AsBytes()
+		require.NoError(t, err)
+		assert.Equal(t, testValue, string(msgBytes))
+
+		err = ackFn(ctx, nil)
+		require.NoError(t, err)
+
+		// Verify producer received acknowledgment
+		select {
+		case err := <-produceChan:
+			assert.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Timeout waiting for producer acknowledgment")
+		}
+	})
+
+	// Test 2: Client without certificate should be rejected
+	t.Run("no_client_cert", func(t *testing.T) {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCertPEM)
+
+		tlsConfig := &tls.Config{
+			RootCAs: caCertPool,
+		}
+
+		client, err := kgo.NewClient(
+			kgo.SeedBrokers("127.0.0.1:19110"),
+			kgo.DialTLSConfig(tlsConfig),
+			kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, func() string {
+				return "[CLIENT-NO-CERT] "
+			})),
+		)
+		require.NoError(t, err)
+		defer client.Close()
+
+		testTopic := "test-topic-fail"
+		testValue := "should-fail"
+
+		record := &kgo.Record{
+			Topic: testTopic,
+			Value: []byte(testValue),
+		}
+
+		results := client.ProduceSync(ctx, record)
+		require.Len(t, results, 1)
+
+		// Should get an error due to missing client certificate
+		assert.Error(t, results[0].Err)
+		t.Logf("Expected TLS error received: %v", results[0].Err)
+	})
+}
+
