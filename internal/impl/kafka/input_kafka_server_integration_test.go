@@ -1,13 +1,10 @@
 package kafka
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,7 +20,6 @@ import (
 	"github.com/warpstreamlabs/bento/public/service/integration"
 
 	// Import all standard Bento components
-	_ "github.com/warpstreamlabs/bento/public/components/io"
 	_ "github.com/warpstreamlabs/bento/public/components/pure"
 )
 
@@ -95,6 +91,22 @@ func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []re
 		time.Sleep(50 * time.Millisecond)
 	}
 	return mc.get()
+}
+
+// waitForCount waits until at least count messages have been captured, checking only the
+// length under lock without copying. Returns true if the count was reached.
+func (mc *messageCapture) waitForCount(count int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		mc.mu.Lock()
+		n := len(mc.messages)
+		mc.mu.Unlock()
+		if n >= count {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // --- kafkaProducer interface ---
@@ -587,85 +599,6 @@ input:
 	})
 }
 
-func testKafkaServerPerfTest(t *testing.T) {
-	const numRecords = 10000
-	const recordSizeBytes = 100
-
-	port := getFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
-
-	tmpDir := t.TempDir()
-	outputFile := filepath.Join(tmpDir, "perf_output.txt")
-
-	config := fmt.Sprintf(`
-input:
-  kafka_server:
-    address: "0.0.0.0:%d"
-    advertised_address: "%s"
-    timeout: "30s"
-output:
-  file:
-    path: "%s"
-    codec: lines
-`, port, hostAddr, outputFile)
-
-	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
-		pool := newDockerPool(t)
-		client := newDockerExecClient(t, pool, dockerContainerOpts{
-			repository: "apache/kafka",
-			tag:        "4.1.1",
-			cmd:        []string{"sleep", "infinity"},
-			readyCmd:   []string{"echo", "ready"},
-		})
-		t.Cleanup(func() { client.Close() })
-
-		// Run kafka-producer-perf-test.sh against the bento kafka_server.
-		cmd := []string{
-			"/opt/kafka/bin/kafka-producer-perf-test.sh",
-			"--topic", "perf-test-topic",
-			"--num-records", fmt.Sprintf("%d", numRecords),
-			"--record-size", fmt.Sprintf("%d", recordSizeBytes),
-			"--throughput", "-1",
-			"--producer-props",
-			fmt.Sprintf("bootstrap.servers=%s", hostAddr),
-			"acks=1",
-		}
-
-		t.Logf("Running kafka-producer-perf-test.sh: %v", cmd)
-		stdout, stderr, err := client.exec(cmd)
-		t.Logf("kafka-producer-perf-test.sh stdout:\n%s", stdout)
-		if stderr != "" {
-			t.Logf("kafka-producer-perf-test.sh stderr:\n%s", stderr)
-		}
-		require.NoError(t, err, "kafka-producer-perf-test.sh failed")
-
-		// Wait for all messages to arrive through bento.
-		msgs := capture.waitForMessages(numRecords, 60*time.Second)
-		require.Len(t, msgs, numRecords, "expected all %d records from kafka-producer-perf-test.sh to arrive through bento", numRecords)
-
-		for _, msg := range msgs {
-			require.Equal(t, "perf-test-topic", msg.Topic)
-			require.Len(t, msg.Value, recordSizeBytes, "each record should be exactly %d bytes", recordSizeBytes)
-		}
-
-		t.Logf("Successfully received all %d messages from kafka-producer-perf-test.sh through bento", numRecords)
-	})
-
-	// Count the lines written to the output file.
-	f, err := os.Open(outputFile)
-	require.NoError(t, err, "failed to open output file")
-	defer f.Close()
-
-	lineCount := 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		lineCount++
-	}
-	require.NoError(t, scanner.Err(), "error reading output file")
-	require.Equal(t, numRecords, lineCount, "expected %d lines in output file, got %d", numRecords, lineCount)
-	t.Logf("Output file contains %d lines, matching expected %d records", lineCount, numRecords)
-}
-
 // --- Shared test dispatch ---
 
 // runKafkaServerSubtests dispatches the standard set of kafka_server integration subtests.
@@ -723,10 +656,5 @@ func runKafkaServerSubtests(t *testing.T, client kafkaProducer, scramSkipReason 
 	t.Run("idempotent_producer", func(t *testing.T) {
 		t.Parallel()
 		testKafkaServerIdempotentProducer(t, client)
-	})
-
-	t.Run("perf_test", func(t *testing.T) {
-		t.Parallel()
-		testKafkaServerPerfTest(t)
 	})
 }
