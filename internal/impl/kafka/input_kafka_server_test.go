@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kbin"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -729,6 +730,148 @@ address: "127.0.0.1:19098"
 	case <-time.After(5 * time.Second):
 		t.Fatal("Timeout waiting for produce acknowledgment")
 	}
+}
+
+func TestKafkaServerInputInvalidAcks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19099"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Send a raw Kafka produce request with invalid acks value (e.g., acks=5)
+	conn, err := net.Dial("tcp", "127.0.0.1:19099")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Build a produce request with acks=5 (invalid)
+	produceReq := kmsg.NewProduceRequest()
+	produceReq.SetVersion(9)
+	produceReq.Acks = 5 // Invalid value
+	produceReq.TimeoutMillis = 5000
+	produceReq.Topics = []kmsg.ProduceRequestTopic{
+		{
+			Topic: "test-topic",
+			Partitions: []kmsg.ProduceRequestTopicPartition{
+				{Partition: 0},
+			},
+		},
+	}
+
+	// Serialize the request
+	var requestBody []byte
+	requestBody = kbin.AppendInt16(requestBody, produceReq.Key())       // api key
+	requestBody = kbin.AppendInt16(requestBody, produceReq.GetVersion()) // api version
+	requestBody = kbin.AppendInt32(requestBody, 1)                       // correlation ID
+	requestBody = kbin.AppendInt16(requestBody, -1)                      // null client ID
+	requestBody = append(requestBody, 0)                                 // empty tagged fields (flexible)
+	requestBody = produceReq.AppendTo(requestBody)
+
+	// Send with size prefix
+	sizePrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(sizePrefix, uint32(len(requestBody)))
+
+	_, err = conn.Write(append(sizePrefix, requestBody...))
+	require.NoError(t, err)
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	respSizeBuf := make([]byte, 4)
+	_, err = io.ReadFull(conn, respSizeBuf)
+	require.NoError(t, err)
+
+	respSize := binary.BigEndian.Uint32(respSizeBuf)
+	require.Greater(t, respSize, uint32(0), "Response should not be empty")
+
+	respBuf := make([]byte, respSize)
+	_, err = io.ReadFull(conn, respBuf)
+	require.NoError(t, err)
+
+	// Parse the response - first 4 bytes are correlation ID
+	corrID := binary.BigEndian.Uint32(respBuf[:4])
+	assert.Equal(t, uint32(1), corrID)
+
+	// Parse the produce response body (skip correlation ID and tag buffer)
+	var produceResp kmsg.ProduceResponse
+	produceResp.SetVersion(9)
+	err = produceResp.ReadFrom(respBuf[4+1:]) // +1 for empty tag buffer in flexible response
+	require.NoError(t, err)
+
+	// Verify error code is InvalidRequiredAcks
+	require.Len(t, produceResp.Topics, 1)
+	require.Len(t, produceResp.Topics[0].Partitions, 1)
+	assert.Equal(t, kerr.InvalidRequiredAcks.Code, produceResp.Topics[0].Partitions[0].ErrorCode,
+		"Expected InvalidRequiredAcks error code")
+}
+
+func TestKafkaServerInputMessageTooLarge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	// Set a small max_message_bytes to trigger the per-partition check.
+	// The franz-go client may compress records, so we use random
+	// (incompressible) data to ensure the batch exceeds this limit.
+	config := `
+address: "127.0.0.1:19100"
+max_message_bytes: 100
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Create a producer client with no compression so the batch is guaranteed
+	// to exceed max_message_bytes.
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19100"),
+		kgo.DisableIdempotentWrite(),
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Use random data so it cannot be compressed below max_message_bytes.
+	randomValue := make([]byte, 200)
+	_, err = rand.Read(randomValue)
+	require.NoError(t, err)
+
+	record := &kgo.Record{
+		Topic: "test-topic",
+		Value: randomValue,
+	}
+
+	// The produce should fail with MESSAGE_TOO_LARGE (non-retriable).
+	results := client.ProduceSync(ctx, record)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0].Err, kerr.MessageTooLarge, "Expected MESSAGE_TOO_LARGE error for oversized message")
+	t.Logf("Got expected MESSAGE_TOO_LARGE error for oversized message: %v", results[0].Err)
 }
 
 // Quick round-trip test: ensure the metadata response constructed can be
@@ -1582,6 +1725,138 @@ func TestProduceResponsePartitionSerialization(t *testing.T) {
 		require.Len(t, parsedResp.Topics[0].Partitions, 1)
 		assert.Equal(t, int32(0), parsedResp.Topics[0].Partitions[0].Partition)
 		assert.Equal(t, int16(0), parsedResp.Topics[0].Partitions[0].ErrorCode)
+	})
+}
+
+func TestBuildProduceResponseTopicsPartitionErrors(t *testing.T) {
+	t.Run("nil partitionErrors gives all partitions the default error code", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		resp := buildProduceResponseTopics(topics, kerr.RequestTimedOut.Code, nil)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 2)
+		assert.Equal(t, kerr.RequestTimedOut.Code, resp[0].Partitions[0].ErrorCode)
+		assert.Equal(t, kerr.RequestTimedOut.Code, resp[0].Partitions[1].ErrorCode)
+	})
+
+	t.Run("per-partition error overrides default for that partition only", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+					{Partition: 2},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "topic-a", partition: 1}: kerr.MessageTooLarge.Code,
+		}
+		resp := buildProduceResponseTopics(topics, 0, partErrors)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 3)
+		// partition 0: default (success)
+		assert.Equal(t, int16(0), resp[0].Partitions[0].ErrorCode)
+		assert.Equal(t, int32(0), resp[0].Partitions[0].Partition)
+		// partition 1: per-partition override
+		assert.Equal(t, kerr.MessageTooLarge.Code, resp[0].Partitions[1].ErrorCode)
+		assert.Equal(t, int32(1), resp[0].Partitions[1].Partition)
+		// partition 2: default (success)
+		assert.Equal(t, int16(0), resp[0].Partitions[2].ErrorCode)
+		assert.Equal(t, int32(2), resp[0].Partitions[2].Partition)
+	})
+
+	t.Run("multiple topics with mixed per-partition errors", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "allowed-topic",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+				},
+			},
+			{
+				Topic: "disallowed-topic",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "disallowed-topic", partition: 0}: kerr.UnknownTopicOrPartition.Code,
+			{topic: "disallowed-topic", partition: 1}: kerr.UnknownTopicOrPartition.Code,
+		}
+		resp := buildProduceResponseTopics(topics, 0, partErrors)
+
+		require.Len(t, resp, 2)
+
+		// allowed-topic: partition 0 should get the default (success)
+		assert.Equal(t, "allowed-topic", resp[0].Topic)
+		require.Len(t, resp[0].Partitions, 1)
+		assert.Equal(t, int16(0), resp[0].Partitions[0].ErrorCode)
+
+		// disallowed-topic: both partitions should get the per-partition error
+		assert.Equal(t, "disallowed-topic", resp[1].Topic)
+		require.Len(t, resp[1].Partitions, 2)
+		assert.Equal(t, kerr.UnknownTopicOrPartition.Code, resp[1].Partitions[0].ErrorCode)
+		assert.Equal(t, kerr.UnknownTopicOrPartition.Code, resp[1].Partitions[1].ErrorCode)
+	})
+
+	t.Run("per-partition error preserved even with non-zero default", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "topic-a", partition: 0}: kerr.MessageTooLarge.Code,
+		}
+		// default is a pipeline error, but partition 0 should still show MessageTooLarge
+		resp := buildProduceResponseTopics(topics, kerr.UnknownServerError.Code, partErrors)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 2)
+		// partition 0: per-partition override takes precedence over default
+		assert.Equal(t, kerr.MessageTooLarge.Code, resp[0].Partitions[0].ErrorCode)
+		// partition 1: gets the default pipeline error
+		assert.Equal(t, kerr.UnknownServerError.Code, resp[0].Partitions[1].ErrorCode)
+	})
+
+	t.Run("response fields are properly initialized", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 5},
+				},
+			},
+		}
+		resp := buildProduceResponseTopics(topics, 0, nil)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 1)
+		p := resp[0].Partitions[0]
+		assert.Equal(t, int32(5), p.Partition)
+		assert.Equal(t, int64(0), p.BaseOffset)
+		assert.Equal(t, int64(-1), p.LogAppendTime)
+		assert.Equal(t, int64(0), p.LogStartOffset)
+		// CurrentLeader should be {-1, -1} from NewProduceResponseTopicPartition()
+		assert.Equal(t, int32(-1), p.CurrentLeader.LeaderID)
+		assert.Equal(t, int32(-1), p.CurrentLeader.LeaderEpoch)
 	})
 }
 

@@ -1272,8 +1272,15 @@ func (k *kafkaServerInput) handleMetadataReq(conn net.Conn, connID uint64, corre
 	return k.sendResponse(conn, connID, correlationID, resp)
 }
 
+// partitionErrorKey uniquely identifies a topic-partition pair for error tracking.
+type partitionErrorKey struct {
+	topic     string
+	partition int32
+}
+
 // buildProduceResponseTopics constructs response topics for all topics/partitions in a produce request.
-func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int16) []kmsg.ProduceResponseTopic {
+// partitionErrors provides per-partition error code overrides (e.g., MessageTooLarge, UnknownTopicOrPartition).
+func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, defaultErrorCode int16, partitionErrors map[partitionErrorKey]int16) []kmsg.ProduceResponseTopic {
 	result := make([]kmsg.ProduceResponseTopic, 0, len(topics))
 	for _, topic := range topics {
 		respTopic := kmsg.ProduceResponseTopic{
@@ -1285,10 +1292,15 @@ func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int
 			// of tagged fields (CurrentLeader defaults to -1,-1 which means "not present")
 			partResp := kmsg.NewProduceResponseTopicPartition()
 			partResp.Partition = partition.Partition
-			partResp.ErrorCode = errorCode
 			partResp.BaseOffset = 0
 			partResp.LogAppendTime = -1
 			partResp.LogStartOffset = 0
+			// Use per-partition error if set, otherwise use the default error code
+			if errCode, ok := partitionErrors[partitionErrorKey{topic.Topic, partition.Partition}]; ok {
+				partResp.ErrorCode = errCode
+			} else {
+				partResp.ErrorCode = defaultErrorCode
+			}
 			respTopic.Partitions = append(respTopic.Partitions, partResp)
 		}
 		result = append(result, respTopic)
@@ -1299,11 +1311,23 @@ func buildProduceResponseTopics(topics []kmsg.ProduceRequestTopic, errorCode int
 func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remoteAddr string, correlationID int32, req *kmsg.ProduceRequest, resp *kmsg.ProduceResponse) error {
 	k.logger.Debugf("[conn:%d] Produce request: correlationID=%d, acks=%d, topics=%d", connID, correlationID, req.Acks, len(req.Topics))
 
+	// Validate acks value (must be -1, 0, or 1) per Kafka protocol
+	switch req.Acks {
+	case -1, 0, 1:
+	default:
+		k.logger.Warnf("[conn:%d] Invalid acks value: %d", connID, req.Acks)
+		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.InvalidRequiredAcks.Code, nil)
+		return k.sendResponse(conn, connID, correlationID, resp)
+	}
+
 	// Create context with timeout for this request
 	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
 	defer cancel()
 
 	var batch service.MessageBatch
+
+	// Track per-partition errors (e.g., topic filtering, message too large)
+	partErrors := make(map[partitionErrorKey]int16)
 
 	// Iterate through topics
 	for _, topic := range req.Topics {
@@ -1314,17 +1338,9 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		if k.allowedTopics != nil {
 			if _, ok := k.allowedTopics[topicName]; !ok {
 				k.logger.Warnf("[conn:%d] Rejecting produce to disallowed topic: %s", connID, topicName)
-				// Return error for disallowed topic instead of silently dropping
-				respTopic := kmsg.ProduceResponseTopic{
-					Topic: topicName,
-				}
 				for _, partition := range topic.Partitions {
-					partResp := kmsg.NewProduceResponseTopicPartition()
-					partResp.Partition = partition.Partition
-					partResp.ErrorCode = kerr.UnknownTopicOrPartition.Code
-					respTopic.Partitions = append(respTopic.Partitions, partResp)
+					partErrors[partitionErrorKey{topicName, partition.Partition}] = kerr.UnknownTopicOrPartition.Code
 				}
-				resp.Topics = append(resp.Topics, respTopic)
 				continue
 			}
 		}
@@ -1334,6 +1350,13 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 			k.logger.Debugf("[conn:%d] Partition %d: Records=%v, len=%d", connID, i, partition.Records != nil, len(partition.Records))
 			if len(partition.Records) == 0 {
 				k.logger.Debugf("[conn:%d] Skipping partition %d (empty records)", connID, i)
+				continue
+			}
+
+			// Check message size before parsing to avoid wasting CPU on oversized batches
+			if k.maxMessageBytes > 0 && len(partition.Records) > k.maxMessageBytes {
+				k.logger.Warnf("[conn:%d] Record batch too large for topic=%s partition=%d: %d > %d", connID, topicName, partition.Partition, len(partition.Records), k.maxMessageBytes)
+				partErrors[partitionErrorKey{topicName, partition.Partition}] = kerr.MessageTooLarge.Code
 				continue
 			}
 
@@ -1354,7 +1377,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	// If no messages, still need to build response for all requested topics/partitions
 	if len(batch) == 0 {
 		k.logger.Debugf("[conn:%d] No messages to process, building success response", connID)
-		resp.Topics = buildProduceResponseTopics(req.Topics, 0)
+		resp.Topics = buildProduceResponseTopics(req.Topics, 0, partErrors)
 		return k.sendResponse(conn, connID, correlationID, resp)
 	}
 
@@ -1383,7 +1406,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 		k.logger.Debugf("[conn:%d] Successfully sent batch to pipeline", connID)
 	case <-ctx.Done():
 		k.logger.Warnf("[conn:%d] Timeout sending batch to pipeline", connID)
-		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
+		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code, partErrors)
 		return k.sendResponse(conn, connID, correlationID, resp)
 	case <-k.shutdownCh:
 		return fmt.Errorf("shutting down")
@@ -1397,14 +1420,14 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 	case ackErr := <-resChan:
 		if ackErr != nil {
 			k.logger.Warnf("[conn:%d] Pipeline returned error: %v", connID, ackErr)
-			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.UnknownServerError.Code)
+			resp.Topics = buildProduceResponseTopics(req.Topics, kerr.UnknownServerError.Code, partErrors)
 		} else {
 			k.logger.Debugf("[conn:%d] Pipeline acknowledged successfully", connID)
-			resp.Topics = buildProduceResponseTopics(req.Topics, 0)
+			resp.Topics = buildProduceResponseTopics(req.Topics, 0, partErrors)
 		}
 	case <-ctx.Done():
 		k.logger.Warnf("[conn:%d] Timeout waiting for pipeline acknowledgment", connID)
-		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code)
+		resp.Topics = buildProduceResponseTopics(req.Topics, kerr.RequestTimedOut.Code, partErrors)
 	case <-k.shutdownCh:
 		return fmt.Errorf("shutting down")
 	}
