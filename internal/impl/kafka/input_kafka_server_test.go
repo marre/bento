@@ -768,6 +768,9 @@ address: "127.0.0.1:19099"
 	produceReq.Topics = []kmsg.ProduceRequestTopic{
 		{
 			Topic: "test-topic",
+			Partitions: []kmsg.ProduceRequestTopicPartition{
+				{Partition: 0},
+			},
 		},
 	}
 
@@ -812,7 +815,9 @@ address: "127.0.0.1:19099"
 
 	// Verify error code is InvalidRequiredAcks
 	require.Len(t, produceResp.Topics, 1)
-	require.Len(t, produceResp.Topics[0].Partitions, 0, "No partitions expected since the topic had no partitions in request")
+	require.Len(t, produceResp.Topics[0].Partitions, 1)
+	assert.Equal(t, kerr.InvalidRequiredAcks.Code, produceResp.Topics[0].Partitions[0].ErrorCode,
+		"Expected InvalidRequiredAcks error code")
 }
 
 func TestKafkaServerInputMessageTooLarge(t *testing.T) {
@@ -865,8 +870,8 @@ max_message_bytes: 100
 	// The produce should fail with MESSAGE_TOO_LARGE (non-retriable).
 	results := client.ProduceSync(ctx, record)
 	require.Len(t, results, 1)
-	require.Error(t, results[0].Err, "Expected error for oversized message")
-	t.Logf("Got expected error for oversized message: %v", results[0].Err)
+	require.ErrorIs(t, results[0].Err, kerr.MessageTooLarge, "Expected MESSAGE_TOO_LARGE error for oversized message")
+	t.Logf("Got expected MESSAGE_TOO_LARGE error for oversized message: %v", results[0].Err)
 }
 
 // Quick round-trip test: ensure the metadata response constructed can be

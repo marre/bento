@@ -1354,7 +1354,7 @@ func (k *kafkaServerInput) handleProduceReq(conn net.Conn, connID uint64, remote
 			}
 
 			// Check message size before parsing to avoid wasting CPU on oversized batches
-			if len(partition.Records) > k.maxMessageBytes {
+			if k.maxMessageBytes > 0 && len(partition.Records) > k.maxMessageBytes {
 				k.logger.Warnf("[conn:%d] Record batch too large for topic=%s partition=%d: %d > %d", connID, topicName, partition.Partition, len(partition.Records), k.maxMessageBytes)
 				partErrors[partitionErrorKey{topicName, partition.Partition}] = kerr.MessageTooLarge.Code
 				continue
