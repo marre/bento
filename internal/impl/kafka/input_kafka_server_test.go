@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kbin"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -1719,6 +1720,138 @@ func TestProduceResponsePartitionSerialization(t *testing.T) {
 		require.Len(t, parsedResp.Topics[0].Partitions, 1)
 		assert.Equal(t, int32(0), parsedResp.Topics[0].Partitions[0].Partition)
 		assert.Equal(t, int16(0), parsedResp.Topics[0].Partitions[0].ErrorCode)
+	})
+}
+
+func TestBuildProduceResponseTopicsPartitionErrors(t *testing.T) {
+	t.Run("nil partitionErrors gives all partitions the default error code", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		resp := buildProduceResponseTopics(topics, kerr.RequestTimedOut.Code, nil)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 2)
+		assert.Equal(t, kerr.RequestTimedOut.Code, resp[0].Partitions[0].ErrorCode)
+		assert.Equal(t, kerr.RequestTimedOut.Code, resp[0].Partitions[1].ErrorCode)
+	})
+
+	t.Run("per-partition error overrides default for that partition only", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+					{Partition: 2},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "topic-a", partition: 1}: kerr.MessageTooLarge.Code,
+		}
+		resp := buildProduceResponseTopics(topics, 0, partErrors)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 3)
+		// partition 0: default (success)
+		assert.Equal(t, int16(0), resp[0].Partitions[0].ErrorCode)
+		assert.Equal(t, int32(0), resp[0].Partitions[0].Partition)
+		// partition 1: per-partition override
+		assert.Equal(t, kerr.MessageTooLarge.Code, resp[0].Partitions[1].ErrorCode)
+		assert.Equal(t, int32(1), resp[0].Partitions[1].Partition)
+		// partition 2: default (success)
+		assert.Equal(t, int16(0), resp[0].Partitions[2].ErrorCode)
+		assert.Equal(t, int32(2), resp[0].Partitions[2].Partition)
+	})
+
+	t.Run("multiple topics with mixed per-partition errors", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "allowed-topic",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+				},
+			},
+			{
+				Topic: "disallowed-topic",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "disallowed-topic", partition: 0}: kerr.UnknownTopicOrPartition.Code,
+			{topic: "disallowed-topic", partition: 1}: kerr.UnknownTopicOrPartition.Code,
+		}
+		resp := buildProduceResponseTopics(topics, 0, partErrors)
+
+		require.Len(t, resp, 2)
+
+		// allowed-topic: partition 0 should get the default (success)
+		assert.Equal(t, "allowed-topic", resp[0].Topic)
+		require.Len(t, resp[0].Partitions, 1)
+		assert.Equal(t, int16(0), resp[0].Partitions[0].ErrorCode)
+
+		// disallowed-topic: both partitions should get the per-partition error
+		assert.Equal(t, "disallowed-topic", resp[1].Topic)
+		require.Len(t, resp[1].Partitions, 2)
+		assert.Equal(t, kerr.UnknownTopicOrPartition.Code, resp[1].Partitions[0].ErrorCode)
+		assert.Equal(t, kerr.UnknownTopicOrPartition.Code, resp[1].Partitions[1].ErrorCode)
+	})
+
+	t.Run("per-partition error preserved even with non-zero default", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 0},
+					{Partition: 1},
+				},
+			},
+		}
+		partErrors := map[partitionErrorKey]int16{
+			{topic: "topic-a", partition: 0}: kerr.MessageTooLarge.Code,
+		}
+		// default is a pipeline error, but partition 0 should still show MessageTooLarge
+		resp := buildProduceResponseTopics(topics, kerr.UnknownServerError.Code, partErrors)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 2)
+		// partition 0: per-partition override takes precedence over default
+		assert.Equal(t, kerr.MessageTooLarge.Code, resp[0].Partitions[0].ErrorCode)
+		// partition 1: gets the default pipeline error
+		assert.Equal(t, kerr.UnknownServerError.Code, resp[0].Partitions[1].ErrorCode)
+	})
+
+	t.Run("response fields are properly initialized", func(t *testing.T) {
+		topics := []kmsg.ProduceRequestTopic{
+			{
+				Topic: "topic-a",
+				Partitions: []kmsg.ProduceRequestTopicPartition{
+					{Partition: 5},
+				},
+			},
+		}
+		resp := buildProduceResponseTopics(topics, 0, nil)
+
+		require.Len(t, resp, 1)
+		require.Len(t, resp[0].Partitions, 1)
+		p := resp[0].Partitions[0]
+		assert.Equal(t, int32(5), p.Partition)
+		assert.Equal(t, int64(0), p.BaseOffset)
+		assert.Equal(t, int64(-1), p.LogAppendTime)
+		assert.Equal(t, int64(0), p.LogStartOffset)
+		// CurrentLeader should be {-1, -1} from NewProduceResponseTopicPartition()
+		assert.Equal(t, int32(-1), p.CurrentLeader.LeaderID)
+		assert.Equal(t, int32(-1), p.CurrentLeader.LeaderEpoch)
 	})
 }
 
