@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"runtime"
 	"strings"
 	"sync"
@@ -100,6 +101,21 @@ func getFreePort(t *testing.T) int {
 	return port
 }
 
+// waitForTCPReady polls until the given TCP address is accepting connections.
+func waitForTCPReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s to accept connections", addr)
+}
+
 // kafkaDockerClient wraps a Docker container running Kafka tools
 type kafkaDockerClient struct {
 	pool     *dockertest.Pool
@@ -114,7 +130,7 @@ func newKafkaDockerClient(t *testing.T, pool *dockertest.Pool) *kafkaDockerClien
 	// Use apache/kafka image which includes CLI tools
 	runOpts := &dockertest.RunOptions{
 		Repository: "apache/kafka",
-		Tag:        "latest",
+		Tag:        "4.1.1",
 		Cmd:        []string{"sleep", "infinity"}, // Keep container running
 	}
 
@@ -134,14 +150,22 @@ func newKafkaDockerClient(t *testing.T, pool *dockertest.Pool) *kafkaDockerClien
 	// Set expiration
 	_ = resource.Expire(300)
 
-	// Wait for container to be ready
-	time.Sleep(2 * time.Second)
-
-	return &kafkaDockerClient{
+	client := &kafkaDockerClient{
 		pool:     pool,
 		resource: resource,
 		t:        t,
 	}
+
+	// Wait for container to be ready by executing a command inside it
+	err = pool.Retry(func() error {
+		_, _, execErr := client.execInContainer([]string{"echo", "ready"})
+		return execErr
+	})
+	if err != nil {
+		t.Skipf("Docker container did not become ready: %v", err)
+	}
+
+	return client
 }
 
 // Close cleans up the Docker container
@@ -462,8 +486,9 @@ func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []re
 	return mc.get()
 }
 
-// runKafkaServerTestWithCapture runs a kafka_server and captures received messages
-func runKafkaServerTestWithCapture(t *testing.T, configYAML string, testFn func(ctx context.Context, capture *messageCapture)) {
+// runKafkaServerTestWithCapture runs a kafka_server and captures received messages.
+// port is the local port the kafka_server listens on, used to wait for readiness.
+func runKafkaServerTestWithCapture(t *testing.T, port int, configYAML string, testFn func(ctx context.Context, capture *messageCapture)) {
 	t.Helper()
 
 	capture := &messageCapture{}
@@ -506,8 +531,8 @@ func runKafkaServerTestWithCapture(t *testing.T, configYAML string, testFn func(
 		_ = stream.Run(ctx)
 	}()
 
-	// Give the server time to start
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the server to start accepting connections
+	waitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 
 	// Run the test
 	testFn(ctx, capture)
@@ -518,8 +543,8 @@ func runKafkaServerTestWithCapture(t *testing.T, configYAML string, testFn func(
 }
 
 // runKafkaServerTest runs a kafka_server and executes a test function (legacy without capture)
-func runKafkaServerTest(t *testing.T, configYAML string, testFn func(ctx context.Context)) {
-	runKafkaServerTestWithCapture(t, configYAML, func(ctx context.Context, _ *messageCapture) {
+func runKafkaServerTest(t *testing.T, port int, configYAML string, testFn func(ctx context.Context)) {
+	runKafkaServerTestWithCapture(t, port, configYAML, func(ctx context.Context, _ *messageCapture) {
 		testFn(ctx)
 	})
 }
@@ -575,8 +600,8 @@ output:
 		_ = stream.Run(ctx)
 	}()
 
-	// Give the server time to start
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the server to start accepting connections
+	waitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 
 	// Produce a message
 	err = client.produceMessage(hostAddr, "test-topic", `{"message": "hello from docker"}`)
@@ -609,7 +634,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		messages := make([]string, 10)
 		for i := 0; i < 10; i++ {
 			messages[i] = fmt.Sprintf(`{"index": %d}`, i)
@@ -648,7 +673,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceWithSASLPlain(hostAddr, "auth-topic", `{"auth": "PLAIN"}`, "testuser", "testpass")
 		require.NoError(t, err)
 
@@ -680,7 +705,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceWithSASLPlainExpectFailure(hostAddr, "should-fail-topic", `{"should": "fail"}`, "testuser", "wrongpassword")
 		assert.Error(t, err)
 		t.Logf("SASL PLAIN wrong password correctly rejected: %v", err)
@@ -710,7 +735,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceWithSASLScram(hostAddr, "scram-topic", `{"auth": "SCRAM-SHA-256"}`, "scramuser", "scrampass", "SCRAM-SHA-256")
 		require.NoError(t, err)
 
@@ -742,7 +767,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceWithSASLScram(hostAddr, "scram512-topic", `{"auth": "SCRAM-SHA-512"}`, "scramuser", "scrampass", "SCRAM-SHA-512")
 		require.NoError(t, err)
 
@@ -774,7 +799,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceWithSASLScramExpectFailure(hostAddr, "should-fail-topic", `{"should": "fail"}`, "scramuser", "wrongpassword", "SCRAM-SHA-256")
 		assert.Error(t, err)
 		t.Logf("SASL SCRAM wrong password correctly rejected: %v", err)
@@ -800,7 +825,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		err := client.produceMessageWithKey(hostAddr, "key-topic", "my-key", `{"test": "with_key"}`)
 		require.NoError(t, err)
 
@@ -849,7 +874,7 @@ input:
 	client := newKafkaDockerClient(t, pool)
 	defer client.Close()
 
-	runKafkaServerTestWithCapture(t, config, func(ctx context.Context, capture *messageCapture) {
+	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		// Test user1
 		err := client.produceWithSASLPlain(hostAddr, "user1-topic", `{"user": "user1"}`, "user1", "pass1")
 		require.NoError(t, err)
@@ -930,8 +955,8 @@ output:
 		_ = stream.Run(ctx)
 	}()
 
-	// Give the server time to start
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the server to start accepting connections
+	waitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 
 	// Produce a message using idempotent producer
 	err = client.produceMessageIdempotent(hostAddr, "idempotent-topic", `{"message": "hello from idempotent producer"}`)
