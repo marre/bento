@@ -1,10 +1,13 @@
 package kafka
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,6 +23,7 @@ import (
 	"github.com/warpstreamlabs/bento/public/service/integration"
 
 	// Import all standard Bento components
+	_ "github.com/warpstreamlabs/bento/public/components/io"
 	_ "github.com/warpstreamlabs/bento/public/components/pure"
 )
 
@@ -590,6 +594,9 @@ func testKafkaServerPerfTest(t *testing.T) {
 	port := getFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
+	tmpDir := t.TempDir()
+	outputFile := filepath.Join(tmpDir, "perf_output.txt")
+
 	config := fmt.Sprintf(`
 input:
   kafka_server:
@@ -597,8 +604,10 @@ input:
     advertised_address: "%s"
     timeout: "30s"
 output:
-  drop: {}
-`, port, hostAddr)
+  file:
+    path: "%s"
+    codec: lines
+`, port, hostAddr, outputFile)
 
 	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		pool := newDockerPool(t)
@@ -641,6 +650,20 @@ output:
 
 		t.Logf("Successfully received all %d messages from kafka-producer-perf-test.sh through bento", numRecords)
 	})
+
+	// Count the lines written to the output file.
+	f, err := os.Open(outputFile)
+	require.NoError(t, err, "failed to open output file")
+	defer f.Close()
+
+	lineCount := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lineCount++
+	}
+	require.NoError(t, scanner.Err(), "error reading output file")
+	require.Equal(t, numRecords, lineCount, "expected %d lines in output file, got %d", numRecords, lineCount)
+	t.Logf("Output file contains %d lines, matching expected %d records", lineCount, numRecords)
 }
 
 // --- Shared test dispatch ---
