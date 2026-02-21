@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -47,12 +46,6 @@ output:
 `, port, hostAddr, outputFile)
 
 	capture := &messageCapture{}
-
-	// Ensure configYAML has an output section so the stream builder
-	// doesn't create a default stdout output that blocks acknowledgments.
-	if !strings.Contains(config, "output:") {
-		config += "\noutput:\n  drop: {}\n"
-	}
 
 	builder := service.NewStreamBuilder()
 	err := builder.SetYAML(config)
