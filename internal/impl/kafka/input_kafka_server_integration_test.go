@@ -602,31 +602,13 @@ output:
 
 	runKafkaServerTestWithCapture(t, port, config, func(ctx context.Context, capture *messageCapture) {
 		pool := newDockerPool(t)
-
-		runOpts := &dockertest.RunOptions{
-			Repository: "apache/kafka",
-			Tag:        "4.1.1",
-			Cmd:        []string{"sleep", "infinity"},
-		}
-
-		if runtime.GOOS == "linux" {
-			runOpts.ExtraHosts = []string{"host.docker.internal:host-gateway"}
-		}
-
-		resource, err := pool.RunWithOptions(runOpts, func(config *docker.HostConfig) {
-			config.AutoRemove = true
-			config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+		client := newDockerExecClient(t, pool, dockerContainerOpts{
+			repository: "apache/kafka",
+			tag:        "4.1.1",
+			cmd:        []string{"sleep", "infinity"},
+			readyCmd:   []string{"echo", "ready"},
 		})
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = pool.Purge(resource) })
-		_ = resource.Expire(300)
-
-		// Wait for the container to be ready.
-		err = pool.Retry(func() error {
-			_, execErr := resource.Exec([]string{"echo", "ready"}, dockertest.ExecOptions{})
-			return execErr
-		})
-		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
 
 		// Run kafka-producer-perf-test.sh against the bento kafka_server.
 		cmd := []string{
@@ -640,18 +622,13 @@ output:
 			"acks=1",
 		}
 
-		var stdout, stderr bytes.Buffer
 		t.Logf("Running kafka-producer-perf-test.sh: %v", cmd)
-		exitCode, err := resource.Exec(cmd, dockertest.ExecOptions{
-			StdOut: &stdout,
-			StdErr: &stderr,
-		})
-		t.Logf("kafka-producer-perf-test.sh stdout:\n%s", stdout.String())
-		if stderr.Len() > 0 {
-			t.Logf("kafka-producer-perf-test.sh stderr:\n%s", stderr.String())
+		stdout, stderr, err := client.exec(cmd)
+		t.Logf("kafka-producer-perf-test.sh stdout:\n%s", stdout)
+		if stderr != "" {
+			t.Logf("kafka-producer-perf-test.sh stderr:\n%s", stderr)
 		}
-		require.NoError(t, err, "kafka-producer-perf-test.sh exec failed")
-		require.Equal(t, 0, exitCode, "kafka-producer-perf-test.sh exited with non-zero code")
+		require.NoError(t, err, "kafka-producer-perf-test.sh failed")
 
 		// Wait for all messages to arrive through bento.
 		msgs := capture.waitForMessages(numRecords, 60*time.Second)
