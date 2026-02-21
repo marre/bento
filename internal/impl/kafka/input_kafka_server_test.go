@@ -731,6 +731,187 @@ address: "127.0.0.1:19098"
 	}
 }
 
+func TestKafkaServerInputInvalidAcks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	config := `
+address: "127.0.0.1:19099"
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Send a raw Kafka produce request with invalid acks value (e.g., acks=5)
+	conn, err := net.Dial("tcp", "127.0.0.1:19099")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Build a produce request with acks=5 (invalid)
+	produceReq := kmsg.NewProduceRequest()
+	produceReq.SetVersion(9)
+	produceReq.Acks = 5 // Invalid value
+	produceReq.TimeoutMillis = 5000
+	produceReq.Topics = []kmsg.ProduceRequestTopic{
+		{
+			Topic: "test-topic",
+		},
+	}
+
+	// Serialize the request
+	var requestBody []byte
+	requestBody = kbin.AppendInt16(requestBody, produceReq.Key())       // api key
+	requestBody = kbin.AppendInt16(requestBody, produceReq.GetVersion()) // api version
+	requestBody = kbin.AppendInt32(requestBody, 1)                       // correlation ID
+	requestBody = kbin.AppendInt16(requestBody, -1)                      // null client ID
+	requestBody = append(requestBody, 0)                                 // empty tagged fields (flexible)
+	requestBody = produceReq.AppendTo(requestBody)
+
+	// Send with size prefix
+	sizePrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(sizePrefix, uint32(len(requestBody)))
+
+	_, err = conn.Write(append(sizePrefix, requestBody...))
+	require.NoError(t, err)
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	respSizeBuf := make([]byte, 4)
+	_, err = io.ReadFull(conn, respSizeBuf)
+	require.NoError(t, err)
+
+	respSize := binary.BigEndian.Uint32(respSizeBuf)
+	require.Greater(t, respSize, uint32(0), "Response should not be empty")
+
+	respBuf := make([]byte, respSize)
+	_, err = io.ReadFull(conn, respBuf)
+	require.NoError(t, err)
+
+	// Parse the response - first 4 bytes are correlation ID
+	corrID := binary.BigEndian.Uint32(respBuf[:4])
+	assert.Equal(t, uint32(1), corrID)
+
+	// Parse the produce response body (skip correlation ID and tag buffer)
+	var produceResp kmsg.ProduceResponse
+	produceResp.SetVersion(9)
+	err = produceResp.ReadFrom(respBuf[4+1:]) // +1 for empty tag buffer in flexible response
+	require.NoError(t, err)
+
+	// Verify error code is InvalidRequiredAcks
+	require.Len(t, produceResp.Topics, 1)
+	require.Len(t, produceResp.Topics[0].Partitions, 0, "No partitions expected since the topic had no partitions in request")
+}
+
+func TestKafkaServerInputMessageTooLarge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := kafkaServerInputConfig()
+	env := service.NewEnvironment()
+
+	// Set a very small max_message_bytes to trigger the check
+	config := `
+address: "127.0.0.1:19100"
+max_message_bytes: 100
+`
+
+	parsed, err := spec.ParseYAML(config, env)
+	require.NoError(t, err)
+
+	input, err := newKafkaServerInputFromConfig(parsed, service.MockResources())
+	require.NoError(t, err)
+
+	err = input.Connect(ctx)
+	require.NoError(t, err)
+	defer input.Close(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Build a produce request with a record batch larger than max_message_bytes (100 bytes)
+	// We need a valid-looking RecordBatch that's > 100 bytes
+	conn, err := net.Dial("tcp", "127.0.0.1:19100")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	produceReq := kmsg.NewProduceRequest()
+	produceReq.SetVersion(7) // Use non-flexible version for simpler encoding
+	produceReq.Acks = 1
+	produceReq.TimeoutMillis = 5000
+
+	// Create a large dummy record batch (raw bytes > 100 bytes)
+	largeRecords := bytes.Repeat([]byte{0}, 200)
+
+	produceReq.Topics = []kmsg.ProduceRequestTopic{
+		{
+			Topic: "test-topic",
+			Partitions: []kmsg.ProduceRequestTopicPartition{
+				{
+					Partition: 0,
+					Records:   largeRecords,
+				},
+			},
+		},
+	}
+
+	// Serialize the request
+	var requestBody []byte
+	requestBody = kbin.AppendInt16(requestBody, produceReq.Key())        // api key
+	requestBody = kbin.AppendInt16(requestBody, produceReq.GetVersion()) // api version
+	requestBody = kbin.AppendInt32(requestBody, 1)                       // correlation ID
+	requestBody = kbin.AppendInt16(requestBody, -1)                      // null client ID
+	requestBody = produceReq.AppendTo(requestBody)
+
+	// Send with size prefix
+	sizePrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(sizePrefix, uint32(len(requestBody)))
+
+	_, err = conn.Write(append(sizePrefix, requestBody...))
+	require.NoError(t, err)
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	respSizeBuf := make([]byte, 4)
+	_, err = io.ReadFull(conn, respSizeBuf)
+	require.NoError(t, err)
+
+	respSize := binary.BigEndian.Uint32(respSizeBuf)
+	require.Greater(t, respSize, uint32(0), "Response should not be empty")
+
+	respBuf := make([]byte, respSize)
+	_, err = io.ReadFull(conn, respBuf)
+	require.NoError(t, err)
+
+	// Parse the response - first 4 bytes are correlation ID
+	corrID := binary.BigEndian.Uint32(respBuf[:4])
+	assert.Equal(t, uint32(1), corrID)
+
+	// Parse the produce response body (skip correlation ID, no tag buffer for v7 non-flexible)
+	var produceResp kmsg.ProduceResponse
+	produceResp.SetVersion(7)
+	err = produceResp.ReadFrom(respBuf[4:])
+	require.NoError(t, err)
+
+	// Verify response contains the partition with MessageTooLarge error
+	require.Len(t, produceResp.Topics, 1)
+	assert.Equal(t, "test-topic", produceResp.Topics[0].Topic)
+	require.Len(t, produceResp.Topics[0].Partitions, 1)
+	assert.Equal(t, int32(0), produceResp.Topics[0].Partitions[0].Partition)
+	assert.Equal(t, int16(10), produceResp.Topics[0].Partitions[0].ErrorCode, // 10 = MESSAGE_TOO_LARGE
+		"Expected MESSAGE_TOO_LARGE error code")
+}
+
 // Quick round-trip test: ensure the metadata response constructed can be
 // appended-to a buffer and parsed back by kmsg to avoid the 'not enough
 // data' errors the client observed in integration tests.
