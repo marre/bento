@@ -93,6 +93,22 @@ func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []re
 	return mc.get()
 }
 
+// waitForCount waits until at least count messages have been captured, checking only the
+// length under lock without copying. Returns true if the count was reached.
+func (mc *messageCapture) waitForCount(count int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		mc.mu.Lock()
+		n := len(mc.messages)
+		mc.mu.Unlock()
+		if n >= count {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 // --- kafkaProducer interface ---
 
 // kafkaProducer is an interface that both kafkaDockerClient and kcatClient implement,
