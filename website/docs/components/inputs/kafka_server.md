@@ -49,13 +49,10 @@ input:
     address: 0.0.0.0:9092
     advertised_address: ""
     topics: []
-    tls:
-      enabled: false
-      skip_cert_verify: false
-      enable_renegotiation: false
-      root_cas: ""
-      root_cas_file: ""
-      client_certs: []
+    cert_file: ""
+    key_file: ""
+    mtls_auth: ""
+    mtls_cas_files: []
     sasl: [] # No default (optional)
     timeout: 5s
     idle_timeout: "0"
@@ -92,6 +89,9 @@ You can access these metadata fields using [function interpolation](/docs/config
 <Tabs defaultValue="Basic Usage" values={[
 { label: 'Basic Usage', value: 'Basic Usage', },
 { label: 'With TLS', value: 'With TLS', },
+{ label: 'With mTLS', value: 'With mTLS', },
+{ label: 'With mTLS (multiple CAs)', value: 'With mTLS (multiple CAs)', },
+{ label: 'With mTLS (optional verification)', value: 'With mTLS (optional verification)', },
 { label: 'With SASL PLAIN Authentication', value: 'With SASL PLAIN Authentication', },
 { label: 'With SASL SCRAM Authentication', value: 'With SASL SCRAM Authentication', },
 ]}>
@@ -121,11 +121,57 @@ Accept Kafka produce requests over TLS
 input:
   kafka_server:
     address: "0.0.0.0:9093"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+```
+
+</TabItem>
+<TabItem value="With mTLS">
+
+Accept Kafka produce requests with mutual TLS authentication
+
+```yaml
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: require_and_verify
+    mtls_cas_files:
+      - /path/to/client-ca.pem
+```
+
+</TabItem>
+<TabItem value="With mTLS (multiple CAs)">
+
+Accept Kafka produce requests with multiple client certificate authorities
+
+```yaml
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: require_and_verify
+    mtls_cas_files:
+      - /path/to/client-ca-1.pem
+      - /path/to/client-ca-2.pem
+```
+
+</TabItem>
+<TabItem value="With mTLS (optional verification)">
+
+Accept Kafka produce requests with optional client certificate verification
+
+```yaml
+input:
+  kafka_server:
+    address: "0.0.0.0:9093"
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
+    mtls_auth: verify_if_given
+    mtls_cas_files:
+      - /path/to/client-ca.pem
 ```
 
 </TabItem>
@@ -137,11 +183,8 @@ Accept authenticated Kafka produce requests using PLAIN
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: PLAIN
         username: producer1
@@ -160,11 +203,8 @@ Accept authenticated Kafka produce requests using SCRAM-SHA-256
 input:
   kafka_server:
     address: "0.0.0.0:9092"
-    tls:
-      enabled: true
-      client_certs:
-        - cert_file: /path/to/cert.pem
-          key_file: /path/to/key.pem
+    cert_file: /path/to/server-cert.pem
+    key_file: /path/to/server-key.pem
     sasl:
       - mechanism: SCRAM-SHA-256
         username: producer1
@@ -203,145 +243,46 @@ Optional list of topic names to accept. If empty, all topics are accepted.
 Type: `array`  
 Default: `[]`  
 
-### `tls`
+### `cert_file`
 
-Custom TLS settings can be used to override system defaults.
-
-
-Type: `object`  
-
-### `tls.enabled`
-
-Whether custom TLS settings are enabled.
-
-
-Type: `bool`  
-Default: `false`  
-
-### `tls.skip_cert_verify`
-
-Whether to skip server side certificate verification.
-
-
-Type: `bool`  
-Default: `false`  
-
-### `tls.enable_renegotiation`
-
-Whether to allow the remote server to repeatedly request renegotiation. Enable this option if you're seeing the error message `local error: tls: no renegotiation`.
-
-
-Type: `bool`  
-Default: `false`  
-Requires version 1.0.0 or newer  
-
-### `tls.root_cas`
-
-An optional root certificate authority to use. This is a string, representing a certificate chain from the parent trusted root certificate, to possible intermediate signing certificates, to the host certificate.
-:::warning Secret
-This field contains sensitive information that usually shouldn't be added to a config directly, read our [secrets page for more info](/docs/configuration/secrets).
-:::
+An optional server certificate file for enabling TLS.
 
 
 Type: `string`  
 Default: `""`  
 
-```yml
-# Examples
+### `key_file`
 
-root_cas: |-
-  -----BEGIN CERTIFICATE-----
-  ...
-  -----END CERTIFICATE-----
-```
-
-### `tls.root_cas_file`
-
-An optional path of a root certificate authority file to use. This is a file, often with a .pem extension, containing a certificate chain from the parent trusted root certificate, to possible intermediate signing certificates, to the host certificate.
+An optional server key file for enabling TLS.
 
 
 Type: `string`  
 Default: `""`  
 
-```yml
-# Examples
+### `mtls_auth`
 
-root_cas_file: ./root_cas.pem
-```
+Sets the policy the server will follow for mTLS client authentication. Only used when TLS is enabled.
 
-### `tls.client_certs`
 
-A list of client certificates to use. For each certificate either the fields `cert` and `key`, or `cert_file` and `key_file` should be specified, but not both.
+Type: `string`  
+Default: `""`  
+
+| Option | Summary |
+|---|---|
+| `none` | Server will not request a client certificate |
+| `request` | Server will request a client certificate but doesn't require the client to send one |
+| `require` | Server will require any client certificate (doesn't verify it) |
+| `require_and_verify` | Server requires a client certificate and will verify it against the mtls_cas_files |
+| `verify_if_given` | Server will request a client certificate and verify it if provided |
+
+
+### `mtls_cas_files`
+
+An optional list of paths to files containing client certificate authorities to use for verifying client certificates. Only used when mtls_auth is set to verify_if_given or require_and_verify.
 
 
 Type: `array`  
 Default: `[]`  
-
-```yml
-# Examples
-
-client_certs:
-  - cert: foo
-    key: bar
-
-client_certs:
-  - cert_file: ./example.pem
-    key_file: ./example.key
-```
-
-### `tls.client_certs[].cert`
-
-A plain text certificate to use.
-
-
-Type: `string`  
-Default: `""`  
-
-### `tls.client_certs[].key`
-
-A plain text certificate key to use.
-:::warning Secret
-This field contains sensitive information that usually shouldn't be added to a config directly, read our [secrets page for more info](/docs/configuration/secrets).
-:::
-
-
-Type: `string`  
-Default: `""`  
-
-### `tls.client_certs[].cert_file`
-
-The path of a certificate to use.
-
-
-Type: `string`  
-Default: `""`  
-
-### `tls.client_certs[].key_file`
-
-The path of a certificate key to use.
-
-
-Type: `string`  
-Default: `""`  
-
-### `tls.client_certs[].password`
-
-A plain text password for when the private key is password encrypted in PKCS#1 or PKCS#8 format. The obsolete `pbeWithMD5AndDES-CBC` algorithm is not supported for the PKCS#8 format. Warning: Since it does not authenticate the ciphertext, it is vulnerable to padding oracle attacks that can let an attacker recover the plaintext.
-:::warning Secret
-This field contains sensitive information that usually shouldn't be added to a config directly, read our [secrets page for more info](/docs/configuration/secrets).
-:::
-
-
-Type: `string`  
-Default: `""`  
-
-```yml
-# Examples
-
-password: foo
-
-password: ${KEY_PASSWORD}
-```
 
 ### `sasl`
 
