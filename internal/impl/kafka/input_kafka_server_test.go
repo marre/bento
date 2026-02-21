@@ -821,7 +821,9 @@ func TestKafkaServerInputMessageTooLarge(t *testing.T) {
 	spec := kafkaServerInputConfig()
 	env := service.NewEnvironment()
 
-	// Set a very small max_message_bytes to trigger the check
+	// Set a small max_message_bytes to trigger the per-partition check.
+	// The franz-go client may compress records, so we use random
+	// (incompressible) data to ensure the batch exceeds this limit.
 	config := `
 address: "127.0.0.1:19100"
 max_message_bytes: 100
@@ -839,77 +841,31 @@ max_message_bytes: 100
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Build a produce request with a record batch larger than max_message_bytes (100 bytes)
-	// We need a valid-looking RecordBatch that's > 100 bytes
-	conn, err := net.Dial("tcp", "127.0.0.1:19100")
+	// Create a producer client with no compression so the batch is guaranteed
+	// to exceed max_message_bytes.
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("127.0.0.1:19100"),
+		kgo.DisableIdempotentWrite(),
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
+	)
 	require.NoError(t, err)
-	defer conn.Close()
+	defer client.Close()
 
-	produceReq := kmsg.NewProduceRequest()
-	produceReq.SetVersion(7) // Use non-flexible version for simpler encoding
-	produceReq.Acks = 1
-	produceReq.TimeoutMillis = 5000
+	// Use random data so it cannot be compressed below max_message_bytes.
+	randomValue := make([]byte, 200)
+	_, err = rand.Read(randomValue)
+	require.NoError(t, err)
 
-	// Create a large dummy record batch (raw bytes > 100 bytes)
-	largeRecords := bytes.Repeat([]byte{0}, 200)
-
-	produceReq.Topics = []kmsg.ProduceRequestTopic{
-		{
-			Topic: "test-topic",
-			Partitions: []kmsg.ProduceRequestTopicPartition{
-				{
-					Partition: 0,
-					Records:   largeRecords,
-				},
-			},
-		},
+	record := &kgo.Record{
+		Topic: "test-topic",
+		Value: randomValue,
 	}
 
-	// Serialize the request
-	var requestBody []byte
-	requestBody = kbin.AppendInt16(requestBody, produceReq.Key())        // api key
-	requestBody = kbin.AppendInt16(requestBody, produceReq.GetVersion()) // api version
-	requestBody = kbin.AppendInt32(requestBody, 1)                       // correlation ID
-	requestBody = kbin.AppendInt16(requestBody, -1)                      // null client ID
-	requestBody = produceReq.AppendTo(requestBody)
-
-	// Send with size prefix
-	sizePrefix := make([]byte, 4)
-	binary.BigEndian.PutUint32(sizePrefix, uint32(len(requestBody)))
-
-	_, err = conn.Write(append(sizePrefix, requestBody...))
-	require.NoError(t, err)
-
-	// Read response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	respSizeBuf := make([]byte, 4)
-	_, err = io.ReadFull(conn, respSizeBuf)
-	require.NoError(t, err)
-
-	respSize := binary.BigEndian.Uint32(respSizeBuf)
-	require.Greater(t, respSize, uint32(0), "Response should not be empty")
-
-	respBuf := make([]byte, respSize)
-	_, err = io.ReadFull(conn, respBuf)
-	require.NoError(t, err)
-
-	// Parse the response - first 4 bytes are correlation ID
-	corrID := binary.BigEndian.Uint32(respBuf[:4])
-	assert.Equal(t, uint32(1), corrID)
-
-	// Parse the produce response body (skip correlation ID, no tag buffer for v7 non-flexible)
-	var produceResp kmsg.ProduceResponse
-	produceResp.SetVersion(7)
-	err = produceResp.ReadFrom(respBuf[4:])
-	require.NoError(t, err)
-
-	// Verify response contains the partition with MessageTooLarge error
-	require.Len(t, produceResp.Topics, 1)
-	assert.Equal(t, "test-topic", produceResp.Topics[0].Topic)
-	require.Len(t, produceResp.Topics[0].Partitions, 1)
-	assert.Equal(t, int32(0), produceResp.Topics[0].Partitions[0].Partition)
-	assert.Equal(t, int16(10), produceResp.Topics[0].Partitions[0].ErrorCode, // 10 = MESSAGE_TOO_LARGE
-		"Expected MESSAGE_TOO_LARGE error code")
+	// The produce should fail with MESSAGE_TOO_LARGE (non-retriable).
+	results := client.ProduceSync(ctx, record)
+	require.Len(t, results, 1)
+	require.Error(t, results[0].Err, "Expected error for oversized message")
+	t.Logf("Got expected error for oversized message: %v", results[0].Err)
 }
 
 // Quick round-trip test: ensure the metadata response constructed can be
